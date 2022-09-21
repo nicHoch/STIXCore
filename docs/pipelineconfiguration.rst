@@ -85,6 +85,7 @@ enable IDB bridge with entry in stixcore.ini:
 enabled = True
 gsw_path = /opt/STIX-GSW
 
+
 ```
 
 SETUP - Pipeline as systemd service
@@ -96,7 +97,7 @@ SETUP - Pipeline as systemd service
 
 2: update /etc/systemd/system/stix-pipeline.service with log-pathes users if needed
 
-3: Reload the service files to include the new service.
+3: Reload the service files to include the new service. test
 
 `sudo systemctl daemon-reload`
 
