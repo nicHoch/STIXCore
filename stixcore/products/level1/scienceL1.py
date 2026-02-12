@@ -146,8 +146,6 @@ class Spectrogram(ScienceProduct, L1Mixin):
     In level 1 format.
     """
 
-    PRODUCT_PROCESSING_VERSION = 4
-
     NAME = "xray-spec"
     PRODUCT_PROCESSING_VERSION = 4
 
