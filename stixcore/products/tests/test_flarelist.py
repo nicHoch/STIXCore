@@ -14,8 +14,12 @@ from astropy.time import Time
 
 from stixcore.io.product_processors.fits.processors import FitsL3Processor
 from stixcore.products.level3.flarelist import (
-    FlarelistSDCLoc,
+    FlarelistSDCLocation,
+    FlarePositionResult,
+    _empty_flare_position,
+    add_distance_normalized_flux,
     calculate_overlap,
+    cpd_timedel_range,
     longest_constant_sequence,
 )
 from stixcore.products.product import Product
@@ -54,7 +58,7 @@ def flare_data():
 
 @pytest.fixture
 def written_fits(flare_data, tmp_path):
-    prod = FlarelistSDCLoc(
+    prod = FlarelistSDCLocation(
         data=flare_data,
         month=date(2022, 1, 1),
         control=QTable(),
@@ -86,7 +90,7 @@ def test_flarelist_sdcloc_location_roundtrip(written_fits):
     # read back via Product factory — calls on_deserialize internally
     recovered = Product(fits_path)
 
-    assert isinstance(recovered, FlarelistSDCLoc)
+    assert isinstance(recovered, FlarelistSDCLocation)
     assert_quantity_allclose(recovered.data["location_hgs"].lon, orig_hgs_lon, atol=1e-6 * u.deg, equal_nan=True)
     assert_quantity_allclose(recovered.data["location_hgs"].lat, orig_hgs_lat, atol=1e-6 * u.deg, equal_nan=True)
 
@@ -189,3 +193,98 @@ def test_overlap_identical():
     assert result is not None
     assert result.start == r1.start
     assert result.end == r1.end
+
+
+# --- add_distance_normalized_flux ---
+
+FLUX_UNIT = u.ct / (u.s * u.keV * u.cm**2)
+
+
+def test_add_distance_normalized_flux():
+    data = QTable()
+    # flare-time distance (for LC) and background-time distance (for bkg) differ per row
+    data["solo_sun_distance"] = [0.5, 1.0, np.nan] * u.AU
+    data["bkg_solo_sun_distance"] = [0.8, 1.0, 0.5] * u.AU
+    data["lc_peak_flux"] = np.array([[100.0, 10, 1, 5, 2]] * 3) * FLUX_UNIT
+    data["bkg_spec_flux"] = np.array([[4.0, 3, 2, 1, 0.5]] * 3) * FLUX_UNIT
+    # lc_bkg_peak_flux / bkg_spec_flux_ql intentionally absent -> must be skipped, no error
+
+    add_distance_normalized_flux(data)
+
+    # new columns added, originals unchanged
+    assert "lc_peak_flux_at_1au" in data.colnames
+    assert "bkg_spec_flux_at_1au" in data.colnames
+    assert "lc_bkg_peak_flux_at_1au" not in data.colnames  # source column was absent
+    assert np.allclose(data["lc_peak_flux"].to_value(FLUX_UNIT), [[100, 10, 1, 5, 2]] * 3)
+
+    # LC uses solo_sun_distance: 0.5 AU -> x0.25, 1 AU -> x1, NaN -> NaN
+    lc = data["lc_peak_flux_at_1au"].to_value(FLUX_UNIT)
+    assert np.allclose(lc[0], np.array([100, 10, 1, 5, 2]) * 0.25)
+    assert np.allclose(lc[1], [100, 10, 1, 5, 2])
+    assert np.all(np.isnan(lc[2]))
+    # bkg uses bkg_solo_sun_distance: 0.8 AU -> x0.64, 0.5 AU (row 2) -> x0.25
+    bk = data["bkg_spec_flux_at_1au"].to_value(FLUX_UNIT)
+    assert np.allclose(bk[0], np.array([4, 3, 2, 1, 0.5]) * 0.64)
+    assert np.allclose(bk[2], np.array([4, 3, 2, 1, 0.5]) * 0.25)
+    # unit preserved
+    assert data["lc_peak_flux_at_1au"].unit.is_equivalent(FLUX_UNIT)
+
+
+# --- cpd_timedel_range ---
+
+
+def test_cpd_timedel_range():
+    # four bins at t = 0,10,20,30 s with widths 4,4,10,20 ds (0.4,0.4,1.0,2.0 s)
+    times = np.array([0, 10, 20, 30]) * u.s
+    timedels = np.array([4, 4, 10, 20]) * u.ds
+
+    # window fully inside the file -> bins 1 and 2 overlap [5, 25] s
+    ds_min, ds_max = cpd_timedel_range(times, timedels, 5 * u.s, 25 * u.s)
+    assert ds_min.unit == u.ds
+    assert ds_max.unit == u.ds
+    assert ds_min == 4 * u.ds
+    assert ds_max == 10 * u.ds
+
+    # window extends beyond the file (not fully covered) -> all bins overlap
+    ds_min, ds_max = cpd_timedel_range(times, timedels, -100 * u.s, 100 * u.s)
+    assert ds_min == 4 * u.ds
+    assert ds_max == 20 * u.ds
+
+    # no overlap -> (NaN ds, NaN ds)
+    ds_min, ds_max = cpd_timedel_range(times, timedels, 100 * u.s, 200 * u.s)
+    assert ds_min.unit == u.ds
+    assert ds_max.unit == u.ds
+    assert np.isnan(ds_min.value)
+    assert np.isnan(ds_max.value)
+
+
+# --- _empty_flare_position ---
+
+
+def test_empty_flare_position_defaults():
+    peak = Time("2022-01-01T12:00:00")
+    r = _empty_flare_position(peak)
+
+    assert isinstance(r, FlarePositionResult)
+    assert r.status is False
+    assert r.message == ""
+    assert r.anc_path == ""
+    assert r.cpd_path == ""
+    assert r.rcr_at_peak == 0
+    assert r.solo_time == peak  # per-row placeholder passed through
+    # NaN geometry
+    for f in (r.flare_x, r.flare_y, r.flare_z, r.solo_x, r.solo_y, r.solo_z):
+        assert f.unit == u.km
+        assert np.isnan(f.value)
+    assert np.isnan(r.sidelobe)
+    # new ds columns default to NaN deciseconds
+    assert r.min_exposure.unit == u.ds
+    assert np.isnan(r.min_exposure.value)
+    assert r.max_exposure.unit == u.ds
+    assert np.isnan(r.max_exposure.value)
+
+    # overrides applied
+    r2 = _empty_flare_position(peak, message="no CPD data found", anc_path="/some/anc.fits")
+    assert r2.message == "no CPD data found"
+    assert r2.anc_path == "/some/anc.fits"
+    assert r2.status is False  # untouched

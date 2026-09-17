@@ -25,6 +25,15 @@ from astropy.coordinates import SkyCoord
 from astropy.coordinates.representation import CartesianRepresentation
 from astropy.time import Time
 
+__all__ = [
+    "get_rsun_obs",
+    "get_distance_off_limb",
+    "generate_blank_map",
+    "is_visible",
+    "stx_estimate_flare_location",
+    "calculate_sidelobes_ratio",
+]
+
 
 def get_rsun_obs(observer):
     """

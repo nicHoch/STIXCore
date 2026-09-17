@@ -40,9 +40,18 @@ __all__ = [
     "max_rcr_in_window",
     "find_background_file_for_time",
     "BackgroundSelection",
+    "background_spectrum_from_cpd",
+    "rebin_spectrum_to_ql",
+    "rebin_flux_to_ql",
+    "collecting_area_cm2",
 ]
 
 logger = get_logger(__name__)
+
+#: Expected unit of the livetime- and area-corrected flux columns. Computations carry
+#: astropy units through and validate against this with ``.to(FLUX_UNIT)`` rather than
+#: labelling bare floats.
+FLUX_UNIT = u.ct / (u.s * u.keV * u.cm**2)
 
 
 def compute_ql_count_rate(counts, timedel, triggers, energy_delta, *, n_detectors):
@@ -117,6 +126,230 @@ def max_rcr_in_window(times, rcr, start, end, *, fallback):
     if not np.any(mask):
         return fallback
     return int(np.asarray(rcr)[mask].max())
+
+
+#: 0-based detector indices used for a background spectrum: all 32 science
+#: sub-collimators except the Coarse Flare Locator (idx 8) and the Background
+#: monitor (idx 9), i.e. the 30 imaging detectors.
+_IMAGING_DETECTORS = [d for d in range(32) if d not in (8, 9)]
+
+
+def _edges_kev(col):
+    """Return an energy-edge column as a plain float ndarray in keV."""
+    return np.asarray(col.to_value(u.keV) if hasattr(col, "to_value") else col, dtype=float)
+
+
+_PIXEL_AREA_CACHE = None
+
+
+def _pixel_area_cm2():
+    """12-pixel active-area vector (cm^2) from stixcore's ``stx_subc_params`` config.
+
+    STIX Caliste layout is 8 large pixels then 4 small; pixel sizes are identical
+    across detectors so one 12-vector applies to all. Cached after first read.
+    """
+    global _PIXEL_AREA_CACHE
+    if _PIXEL_AREA_CACHE is None:
+        import stixcore.config
+        from stixcore.config.reader import read_subc_params
+
+        path = Path(stixcore.config.__file__).parent / "data" / "common" / "detector" / "stx_subc_params.csv"
+        t = read_subc_params(path)
+        large = float(t["L Pixel Xsize"][0]) * float(t["L Pixel Ysize"][0])  # mm^2
+        small = float(t["S Pixel Xsize"][0]) * float(t["S Pixel Ysize"][0])  # mm^2
+        _PIXEL_AREA_CACHE = np.array([large] * 8 + [small] * 4, dtype=float) / 100.0  # mm^2 -> cm^2
+    return _PIXEL_AREA_CACHE
+
+
+def collecting_area_cm2(product):
+    """Geometric collecting area (cm^2) of a detector+pixel-summed product =
+    ``detector_mask.sum() * sum(pixel_area[pixel_mask])``. Returns ``None`` when the
+    product's control has no detector/pixel mask (e.g. the QL background monitor)."""
+    ctrl = getattr(product, "control", None)
+    if ctrl is None or "detector_mask" not in ctrl.colnames or "pixel_mask" not in ctrl.colnames:
+        return None
+    det = np.asarray(ctrl["detector_mask"][0], dtype=bool)
+    pix = np.asarray(ctrl["pixel_mask"][0], dtype=bool)
+    return float(det.sum()) * float(_pixel_area_cm2()[pix].sum())
+
+
+def _bkg_monitor_area_cm2():
+    """Fixed area (cm^2) of the QL background monitor: one open (grid-less) detector
+    over all 12 pixels."""
+    return float(_pixel_area_cm2().sum())
+
+
+def _cpd_present_channel_mask(cpd):
+    """Boolean mask (length 32) of which science channels are present in a CPD's
+    ``counts`` when only a telemetered subset is stored, or ``None`` if unknown."""
+    ctrl = getattr(cpd, "control", None)
+    if ctrl is None:
+        return None
+    if "energy_bin_mask" in ctrl.colnames:
+        m = np.asarray(ctrl["energy_bin_mask"][0], dtype=bool).ravel()
+        return m if m.size == 32 else None
+    if "energy_bin_edge_mask" in ctrl.colnames:
+        edges = np.asarray(ctrl["energy_bin_edge_mask"][0], dtype=bool).ravel()
+        if edges.size == 33:  # 33 edges -> a channel is present when both its edges are set
+            return edges[:-1] & edges[1:]
+    return None
+
+
+def _align_to_energies(spec, nE, energies, cpd):
+    """Pad/align a per-channel ``spec`` (length ``nE``) to the energies-table length.
+
+    Preserves an astropy unit on ``spec`` (the NaN padding is created in the same unit,
+    so assignment stays unit-checked)."""
+    ne_en = len(energies)
+    if nE == ne_en:
+        return spec
+    unit = getattr(spec, "unit", None)
+    aligned = np.full(ne_en, np.nan)
+    if unit is not None:
+        aligned = aligned * unit
+    mask = _cpd_present_channel_mask(cpd)
+    if mask is not None and mask.size == ne_en and int(mask.sum()) == nE:
+        aligned[mask] = spec
+    elif nE < ne_en:
+        aligned[:nE] = spec
+    else:
+        logger.warning(f"CPD counts have {nE} channels but energies has {ne_en}; truncating")
+        aligned[:] = spec[:ne_en]
+    return aligned
+
+
+def background_spectrum_from_cpd(cpd):
+    """Median quiet-period background spectrum (counts and flux) from a CPD product.
+
+    Sums ``counts`` over the 30 imaging detectors (excl. CFL idx 8, BKG monitor idx 9)
+    and all pixels, then takes the median over the file's time bins (the whole quiet
+    period). ``flux`` is the livetime- and area-normalized rate density
+    ``ct s^-1 keV^-1 cm^-2`` (per-bin then median), mirroring stixpy's
+    ``create_meta_pixels`` normalization:
+    ``flux[t,E] = Σ_dp counts / ((Σ_d livefrac[t,d]·timedel[t]) · (Σ_p area[p]) · dE[E])``.
+    Both are aligned to the product's own ``energies`` table (length = telemetered
+    channels). Reads ``cpd.data["counts"]`` directly (``get_data`` is not robust on all
+    files). Any failure computing the flux yields NaN flux (counts still returned).
+
+    Returns
+    -------
+    (counts, flux, energies)
+    """
+    counts = cpd.data["counts"]
+    counts_q = counts if hasattr(counts, "unit") else np.asarray(counts, dtype=float) * u.ct  # (nt,32,npix,nE) ct
+    nE = counts_q.shape[-1]
+    energies = cpd.energies
+    csum = counts_q[:, _IMAGING_DETECTORS, :, :].sum(axis=(1, 2))  # (nt, nE) ct over imaging det+pix
+    counts_spec = _align_to_energies(np.nanmedian(csum, axis=0), nE, energies, cpd)  # Quantity ct
+
+    flux_spec = np.full(len(energies), np.nan) * FLUX_UNIT
+    try:
+        timedel = cpd.data["timedel"].to(u.s)  # (nt,) — units carried through the livetime rate
+        trig = np.asarray(getattr(cpd.data["triggers"], "value", cpd.data["triggers"]), dtype=float)  # (nt,16)
+        from stixpy.calibration.visibility import STIX_INSTRUMENT
+
+        subcol = np.asarray(STIX_INSTRUMENT.subcol_adc_mapping)  # (32,)
+        livefrac = get_livetime_fraction(trig[:, subcol] / timedel[:, None])[0]  # (nt, 32), dimensionless
+        livefrac = np.asarray(getattr(livefrac, "value", livefrac), dtype=float)
+        exp_t = (livefrac[:, _IMAGING_DETECTORS] * timedel[:, None]).sum(axis=1)  # (nt,) s (Σ over dets)
+        pmask = _cpd_pixel_mask(cpd)  # which of 12 pixels are telemetered
+        pa = _pixel_area_cm2()
+        area = (pa[pmask].sum() if pmask is not None else pa[: counts_q.shape[2]].sum()) * u.cm**2  # cm^2
+        dE = (energies["e_high"] - energies["e_low"]).to(u.keV)  # (ne_en,) keV
+        dE_c = dE if nE == len(energies) else dE[:nE]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            # astropy derives the unit; .to(FLUX_UNIT) both converts and asserts it is correct
+            flux_t = (csum / (exp_t[:, None] * area * dE_c[None, :])).to(FLUX_UNIT)  # (nt, nE)
+        flux_spec = _align_to_energies(np.nanmedian(flux_t, axis=0), nE, energies, cpd)
+    except Exception as e:
+        logger.warning(f"could not compute background flux: {e}")
+
+    return counts_spec, flux_spec, energies
+
+
+def _cpd_pixel_mask(cpd):
+    """Boolean (length 12) of telemetered pixels from the CPD ``pixel_masks`` (row 0),
+    or ``None`` when unavailable."""
+    data = getattr(cpd, "data", None)
+    try:
+        if data is not None and "pixel_masks" in data.colnames:
+            return np.asarray(data["pixel_masks"][0], dtype=bool).ravel()
+    except Exception:
+        pass
+    return None
+
+
+def rebin_spectrum_to_ql(counts_32, energies_32, ql_block):
+    """Rebin a science *counts* spectrum onto the QL energy bands of ``ql_block``.
+
+    ``ql_block`` carries the target band edges (``e_low``/``e_high``) read from the
+    energy table for a given flare (never hardcoded, so a QL binning that changes
+    over time is honored). A science channel contributes to a band when its
+    ``[e_low, e_high]`` lies within the band; whole channels are summed (the edges
+    align). Summing preserves the input unit, so the result carries ``counts_32``'s unit.
+    """
+    e_low = _edges_kev(energies_32["e_low"])
+    e_high = _edges_kev(energies_32["e_high"])
+    b_low = _edges_kev(ql_block["e_low"])
+    b_high = _edges_kev(ql_block["e_high"])
+    unit = getattr(counts_32, "unit", None)
+    counts = np.asarray(getattr(counts_32, "value", counts_32), dtype=float)
+    out = np.full(len(b_low), np.nan)
+    for b in range(len(b_low)):
+        chans = (e_low >= b_low[b]) & (e_high <= b_high[b])
+        if np.any(chans):
+            out[b] = np.nansum(counts[chans])
+    return out * unit if unit is not None else out
+
+
+def rebin_flux_to_ql(flux_32, energies_32, ql_block):
+    """Rebin a science *flux* spectrum (per keV) onto the QL bands of ``ql_block``.
+
+    Flux is a density, so bands combine as the dE-weighted mean
+    ``flux_band = Σ(flux_ch·dE_ch) / Σ dE_ch`` over each band's channels (edges align).
+    The dE weights cancel dimensionally, so the result carries ``flux_32``'s unit.
+    """
+    e_low = _edges_kev(energies_32["e_low"])
+    e_high = _edges_kev(energies_32["e_high"])
+    dE = e_high - e_low
+    b_low = _edges_kev(ql_block["e_low"])
+    b_high = _edges_kev(ql_block["e_high"])
+    unit = getattr(flux_32, "unit", None)
+    flux = np.asarray(getattr(flux_32, "value", flux_32), dtype=float)
+    out = np.full(len(b_low), np.nan)
+    for b in range(len(b_low)):
+        chans = (e_low >= b_low[b]) & (e_high <= b_high[b])
+        denom = np.nansum(dE[chans])
+        if np.any(chans) and denom > 0:
+            out[b] = np.nansum(flux[chans] * dE[chans]) / denom
+    return out * unit if unit is not None else out
+
+
+def _intern_energy_block(energy, energy_look_up, energies_src):
+    """Append ``energies_src`` (channel/e_low/e_high) to the ``energy`` table as a new
+    block if its binning is unseen; return ``(energy, index)``. Blocks are hash-deduped
+    and get an ``index`` one past the current maximum so they never collide with the
+    QL blocks already present."""
+    e_sub = QTable()
+    e_sub["channel"] = energies_src["channel"]
+    e_sub["e_low"] = energies_src["e_low"]
+    e_sub["e_high"] = energies_src["e_high"]
+    e_hash = frozenset(pd.core.util.hashing.hash_array(e_sub.as_array()))
+    if e_hash in energy_look_up:
+        return energy, energy_look_up[e_hash]
+    idx = (int(np.max(energy["index"])) + 1) if (len(energy) > 0 and "index" in energy.colnames) else 0
+    energy_look_up[e_hash] = idx
+    e_sub["index"] = Column(idx, description="energy edge table index", dtype=np.int8)
+    return vstack([energy, e_sub]), idx
+
+
+def _ql_block_for(energy, eidx):
+    """The rows of the ``energy`` table belonging to block ``eidx`` (a flare's QL
+    binning), or ``None`` when the table is empty / has no such block."""
+    if energy is None or len(energy) == 0 or "index" not in energy.colnames:
+        return None
+    sel = np.asarray(energy["index"]) == int(eidx)
+    return energy[sel] if np.any(sel) else None
 
 
 #: Result of :func:`find_background_file_for_time`. ``path`` is a `~pathlib.Path`
@@ -353,6 +586,19 @@ def find_background_file_for_time(
 
 
 class FlareListManager:
+    """Base class for the flare-list source managers.
+
+    Holds the source flare list and the product class it feeds, and provides the shared
+    enrichment machinery that turns raw flare definitions into an enriched flare list:
+    `~stixcore.io.FlareListManager.FlareListManager._build_ql_month_timeline`,
+    `~stixcore.io.FlareListManager.FlareListManager.add_lc_bkg_columns` (quicklook peak /
+    background counts and fluxes) and
+    `~stixcore.io.FlareListManager.FlareListManager.add_background_file_column` (quiet-time
+    background spectrum). The active subclass is
+    `~stixcore.io.FlareListManager.SDCFlareListManager`, which mirrors the operational STIX
+    Data Center flare list. See :doc:`/products/flarelist`.
+    """
+
     @property
     def flarelist(self):
         return self._flarelist
@@ -424,6 +670,12 @@ class FlareListManager:
             rate = compute_ql_count_rate(
                 counts, p.data["timedel"], p.data["triggers"], energy_delta, n_detectors=n_detectors
             )
+            # area-normalize to a flux (ct/s/keV/cm^2): use the product's detector/pixel
+            # masks, falling back to the fixed open-detector area for the QL background monitor
+            area = collecting_area_cm2(p)
+            if area is None:
+                area = _bkg_monitor_area_cm2()
+            rate = rate / (area * u.cm**2)
 
             daily = QTable()
             daily["time"] = p.data["time"]
@@ -454,13 +706,14 @@ class FlareListManager:
         return build_month_timeline(daily_tables), energy, date_to_eidx
 
     def add_lc_bkg_columns(self, data, *, start, end, fido_client):
-        """Populate LC/BKG peak counts + rates, RCR and ``att_in`` on ``data`` from the
+        """Populate LC/BKG peak counts + flux, RCR and ``att_in`` on ``data`` from the
         real L1 QL lightcurve + background products, and return the energy QTable.
 
         ``data`` must already carry ``flare_id`` and the astropy ``Time`` columns
         ``start_UTC`` / ``end_UTC`` / ``peak_UTC``. Columns are added in place:
-        ``lc_peak``, ``lc_peak_rate``, ``lc_bgk_peak``, ``lc_bgk_peak_rate``,
-        ``rcr_at_peak``, ``rcr_max``, ``att_in``, ``energy_index``.
+        ``lc_peak``, ``lc_peak_flux``, ``lc_bkg_peak``, ``lc_bkg_peak_flux``,
+        ``rcr_at_peak``, ``rcr_max``, ``att_in``, ``energy_index``. ``*_flux`` are
+        livetime- and area-normalized (ct/s/keV/cm2).
         """
         n = len(data)
         tol = CONFIG.getfloat("Processing", "flarelist_peak_max_dist_s", fallback=60.0) * u.s
@@ -482,15 +735,18 @@ class FlareListManager:
             track_energy=False,
         )
 
-        lc_peak = np.zeros((n, 5), dtype=np.int64)
-        lc_peak_rate = np.zeros((n, 5), dtype=np.float64)
-        lc_bgk_peak = np.zeros((n, 5), dtype=np.int64)
-        lc_bgk_peak_rate = np.zeros((n, 5), dtype=np.float64)
+        # unit-carrying accumulators: assigning a Quantity slice below is unit-checked, so
+        # a wrong-unit timeline value would raise rather than be silently stored
+        # raw counts kept as unsigned int32 (u.Quantity floats by default; explicit dtype keeps
+        # it uint32 -> FITS 'J' + unsigned TZERO, 4 B/elem exact). No-match rows stay 0, never NaN.
+        lc_peak = u.Quantity(np.zeros((n, 5), dtype=np.uint32), u.ct, dtype=np.uint32)
+        lc_peak_flux = np.zeros((n, 5), dtype=np.float32) * FLUX_UNIT
+        lc_bkg_peak = u.Quantity(np.zeros((n, 5), dtype=np.uint32), u.ct, dtype=np.uint32)
+        lc_bkg_peak_flux = np.zeros((n, 5), dtype=np.float32) * FLUX_UNIT
         rcr_at_peak = np.full(n, -1, dtype=np.int8)
         rcr_max = np.full(n, -1, dtype=np.int8)
         energy_index = np.zeros(n, dtype=np.int8)
 
-        rate_unit = u.ct / (u.s * u.keV)
         lc_has = len(lc_timeline) > 0
         bkg_has = len(bkg_timeline) > 0
         if not lc_has:
@@ -504,8 +760,8 @@ class FlareListManager:
             if lc_has:
                 j = nearest_bin_index(lc_timeline["time"], peak, tol)
                 if j is not None:
-                    lc_peak[i] = lc_timeline["counts"][j].to_value(u.ct)
-                    lc_peak_rate[i] = lc_timeline["counts_rate"][j].to_value(rate_unit)
+                    lc_peak[i] = lc_timeline["counts"][j]  # Quantity ct -> unit-checked assignment
+                    lc_peak_flux[i] = lc_timeline["counts_rate"][j].to(FLUX_UNIT)  # assert flux unit
                     rcr_at_peak[i] = int(lc_timeline["rcr"][j])
                     rcr_max[i] = max_rcr_in_window(
                         lc_timeline["time"],
@@ -520,28 +776,38 @@ class FlareListManager:
             if bkg_has:
                 k = nearest_bin_index(bkg_timeline["time"], peak, tol)
                 if k is not None:
-                    lc_bgk_peak[i] = bkg_timeline["counts"][k].to_value(u.ct)
-                    lc_bgk_peak_rate[i] = bkg_timeline["counts_rate"][k].to_value(rate_unit)
+                    lc_bkg_peak[i] = bkg_timeline["counts"][k]  # Quantity ct -> unit-checked assignment
+                    lc_bkg_peak_flux[i] = bkg_timeline["counts_rate"][k].to(FLUX_UNIT)  # assert flux unit
                 else:
                     logger.warning(f"flare {fid}: no BKG bin within {tol} of peak {peak.isot}")
 
+        # Drop orphan energy-binning blocks: a QL product with a different binning can add
+        # rows to `energy` that no flare references (date_to_eidx keeps the first binning
+        # seen per date). Keep only referenced blocks and renumber energy_index contiguously.
+        if len(energy) > 0 and "index" in energy.colnames:
+            used = sorted({int(x) for x in energy_index})
+            remap = {old: new for new, old in enumerate(used)}
+            energy = energy[[k for k, e in enumerate(energy["index"]) if int(e) in remap]]
+            energy["index"] = np.array([remap[int(x)] for x in energy["index"]], dtype=energy["index"].dtype)
+            energy_index = np.array([remap[int(x)] for x in energy_index], dtype=energy_index.dtype)
+
         data["lc_peak"] = Column(
-            lc_peak * u.ct,
+            lc_peak,  # already a Quantity in ct
             description="raw counts at the L1 QL lightcurve bin nearest the flare peak (5 energy channels)",
-            dtype=np.int64,
+            dtype=np.uint32,
         )
-        data["lc_peak_rate"] = Column(
-            lc_peak_rate * rate_unit,
-            description="livetime-corrected count rate at the peak lightcurve bin (5 energy channels)",
+        data["lc_peak_flux"] = Column(
+            lc_peak_flux,  # already a Quantity in ct/s/keV/cm2
+            description="livetime- and area-corrected flux at the peak lightcurve bin (ct/s/keV/cm2, 5 energy channels)",
         )
-        data["lc_bgk_peak"] = Column(
-            lc_bgk_peak * u.ct,
-            description="raw background counts at the L1 QL background bin nearest the flare peak (5 energy channels)",
-            dtype=np.int64,
+        data["lc_bkg_peak"] = Column(
+            lc_bkg_peak,  # already a Quantity in ct
+            description="raw counts from the STIX background detector at the L1 QL background bin nearest the flare peak (5 energy channels) — unmodulated by imaging subcollimators and not affected by the attenuator",
+            dtype=np.uint32,
         )
-        data["lc_bgk_peak_rate"] = Column(
-            lc_bgk_peak_rate * rate_unit,
-            description="livetime-corrected background count rate at the peak bin (5 energy channels)",
+        data["lc_bkg_peak_flux"] = Column(
+            lc_bkg_peak_flux,  # already a Quantity in ct/s/keV/cm2
+            description="livetime- and area-corrected STIX background detector flux at the peak bin (ct/s/keV/cm2, 5 energy channels)",
         )
         data["rcr_at_peak"] = Column(
             rcr_at_peak, description="rate control regime at the peak bin (>0 attenuator in)", dtype=np.int8
@@ -552,20 +818,41 @@ class FlareListManager:
         data["att_in"] = Column(rcr_max > 0, description="was attenuator in during flare (rcr_max > 0)")
         data["energy_index"] = Column(energy_index, description="energy band index", dtype=np.int8)
 
+        # these CSV-derived placeholders (added in get_data) are superseded here; drop if present
+        for _col in ("bkg_baseline", "bkg_quiet_period"):
+            if _col in data.colnames:
+                del data[_col]
+
         return energy
 
-    def add_background_file_column(self, data, *, fido_client):
-        """Add ``bkg_file`` / ``bkg_rid`` columns: the best quiet-time background
-        CPD file for each flare peak.
+    def add_background_file_column(self, data, *, energy, fido_client):
+        """Add background-file and quiet-period background-spectrum columns per flare.
 
-        ``data`` rows are assumed to be peak-time ascending (as produced by the
-        source flare list), so each per-time background search
-        (:func:`find_background_file_for_time`) is cached with its validity
-        interval and only re-run once a flare peak crosses out of that period.
+        Writes ``bkg_file`` / ``bkg_rid`` (the best quiet-time background CPD file for
+        each flare peak) and, extracted from that file, the median quiet-period
+        background spectrum: raw counts in the native science channels (``bkg_spec``) and
+        rebinned to the flare's QL bands (``bkg_spec_ql``), plus the livetime- and
+        area-normalized flux (ct/s/keV/cm2) in native channels (``bkg_spec_flux``) and
+        rebinned to the QL bands (``bkg_spec_flux_ql``); ``bkg_energy_index`` points at the
+        native binning appended to the ``energy`` table.
+
+        ``data`` rows are assumed peak-time ascending, so the per-time background
+        search (:func:`find_background_file_for_time`) is cached with its validity
+        interval and only re-run when a flare peak leaves that period. The extracted
+        spectrum is likewise cached per background file id, so each CPD is opened only
+        once no matter how many flares share it. Requires the ``energy`` table (from
+        :meth:`add_lc_bkg_columns`) so the QL rebin follows the actual QL binning;
+        returns the (possibly extended, orphan-pruned) ``energy`` table.
         """
         n = len(data)
         bkg_files = [""] * n
         bkg_rids = np.full(n, -1, dtype=np.int64)
+        spec_rows = [None] * n  # native-binning counts spectrum per flare (Quantity ct, length varies)
+        flux_rows = [None] * n  # native-binning flux spectrum per flare (Quantity, ct/s/keV/cm2)
+        bkg_spec_ql = np.full((n, 5), np.nan) * u.ct  # native counts rebinned to QL bands
+        bkg_spec_flux_ql = np.full((n, 5), np.nan) * FLUX_UNIT  # unit-checked on assignment below
+        bkg_energy_index = np.full(n, -1, dtype=np.int16)
+        bkg_solo_sun_distance = np.full(n, np.nan) * u.km  # SOLO-Sun distance at the bkg CPD's time
 
         primer = ""
         baseurl = getattr(fido_client, "baseurl", None)
@@ -574,23 +861,112 @@ class FlareListManager:
             primer = baseurl.replace(datapath, "")
             primer = primer[7:] if primer.startswith("file://") else primer
 
+        energy_look_up_32 = {}  # native binning hash -> index in `energy`
+        spectrum_cache = {}  # rid -> (counts, flux, energies, eidx, dsun_km)
+        rebin_cache = {}  # (rid, energy_index) -> flux_ql (5,)
         selection = None
         searches = 0
+        opens = 0
         for i, row in enumerate(data):
             peak = row["peak_UTC"]
             if selection is None or not (selection.valid_from <= peak <= selection.valid_to):
                 selection = find_background_file_for_time(peak, fido_client=fido_client)
                 searches += 1
-            if selection.path is not None:
-                bkg_files[i] = str(selection.path).replace(primer, "")
-                bkg_rids[i] = selection.rid
+            if selection.path is None:
+                continue
+            bkg_files[i] = str(selection.path).replace(primer, "")
+            bkg_rids[i] = selection.rid
+
+            if selection.rid not in spectrum_cache:
+                try:
+                    cpd = STIXPYProduct(selection.path)
+                    c32, f32, e32 = background_spectrum_from_cpd(cpd)
+                    energy, eidx32 = _intern_energy_block(energy, energy_look_up_32, e32)
+                    meta = getattr(cpd, "meta", None) or {}
+                    dsun = float(meta["DSUN_OBS"]) * u.m if "DSUN_OBS" in meta else np.nan * u.m
+                    spectrum_cache[selection.rid] = (c32, f32, e32, eidx32, dsun.to(u.km))
+                    opens += 1
+                except Exception as e:
+                    logger.warning(f"could not extract background spectrum from {selection.path}: {e}")
+                    spectrum_cache[selection.rid] = None
+            cached = spectrum_cache[selection.rid]
+            if cached is None:
+                continue
+            c32, f32, e32, eidx32, dsun = cached
+            spec_rows[i] = c32
+            flux_rows[i] = f32
+            bkg_energy_index[i] = eidx32
+            bkg_solo_sun_distance[i] = dsun
+
+            eidx_ql = int(data["energy_index"][i]) if "energy_index" in data.colnames else -1
+            ql_block = _ql_block_for(energy, eidx_ql)
+            if ql_block is not None:
+                key = (selection.rid, eidx_ql)
+                if key not in rebin_cache:
+                    rebin_cache[key] = (
+                        rebin_spectrum_to_ql(c32, e32, ql_block),
+                        rebin_flux_to_ql(f32, e32, ql_block),
+                    )
+                bkg_spec_ql[i], bkg_spec_flux_ql[i] = rebin_cache[key]
+
+        # Drop orphan energy blocks (keep those referenced by either the QL energy_index
+        # or the background bkg_energy_index) and renumber both index columns contiguously.
+        if len(energy) > 0 and "index" in energy.colnames:
+            ref_ql = {int(x) for x in data["energy_index"]} if "energy_index" in data.colnames else set()
+            ref_bkg = {int(x) for x in bkg_energy_index if x >= 0}
+            used = sorted(ref_ql | ref_bkg)
+            remap = {old: new for new, old in enumerate(used)}
+            energy = energy[[k for k, e in enumerate(energy["index"]) if int(e) in remap]]
+            energy["index"] = np.array([remap[int(x)] for x in energy["index"]], dtype=energy["index"].dtype)
+            if "energy_index" in data.colnames:
+                data["energy_index"] = np.array(
+                    [remap.get(int(x), 0) for x in data["energy_index"]], dtype=data["energy_index"].dtype
+                )
+            bkg_energy_index = np.array([remap[int(x)] if x >= 0 else -1 for x in bkg_energy_index], dtype=np.int16)
+
+        # native-binning spectra can differ in length across files (telemetered channel
+        # count varies); build rectangular Quantity columns at the widest, padding with NaN.
+        # Assigning the Quantity rows into the Quantity arrays is unit-checked.
+        width = max((len(r) for r in spec_rows if r is not None), default=32)
+        bkg_spec = np.full((n, width), np.nan) * u.ct
+        bkg_spec_flux = np.full((n, width), np.nan) * FLUX_UNIT
+        for i in range(n):
+            if spec_rows[i] is not None:
+                bkg_spec[i, : len(spec_rows[i])] = spec_rows[i]
+            if flux_rows[i] is not None:
+                bkg_spec_flux[i, : len(flux_rows[i])] = flux_rows[i]
 
         data["bkg_file"] = Column(bkg_files, description="path to the quiet-time background CPD file")
         data["bkg_rid"] = Column(
             bkg_rids, description="BSD request id of the selected background file (-1 if none)", dtype=np.int64
         )
-        logger.info(f"background file search ran {searches}x for {n} flares")
-        return data
+        data["bkg_spec"] = Column(
+            bkg_spec,  # already a Quantity in ct
+            description="median quiet-period background counts per science energy channel (30 imaging detectors)",
+        )
+        data["bkg_spec_ql"] = Column(
+            bkg_spec_ql,  # already a Quantity in ct
+            description="median quiet-period background counts rebinned to the QL lightcurve energy bands",
+        )
+        data["bkg_spec_flux"] = Column(
+            bkg_spec_flux,  # already a Quantity in ct/s/keV/cm2
+            description="median quiet-period background flux per science channel (ct/s/keV/cm2, 30 imaging detectors)",
+        )
+        data["bkg_spec_flux_ql"] = Column(
+            bkg_spec_flux_ql,  # already a Quantity in ct/s/keV/cm2
+            description="median quiet-period background flux rebinned to the QL lightcurve energy bands (ct/s/keV/cm2)",
+        )
+        data["bkg_energy_index"] = Column(
+            bkg_energy_index,
+            description="energy table index of the native background binning (-1 if no background file)",
+            dtype=np.int16,
+        )
+        data["bkg_solo_sun_distance"] = Column(
+            bkg_solo_sun_distance,  # already a Quantity in km
+            description="SOLO-Sun distance at the background CPD's observation time (from DSUN_OBS; NaN if none)",
+        )
+        logger.info(f"background file search ran {searches}x, opened {opens} CPD files for {n} flares")
+        return energy
 
 
 class SCFlareListManager(FlareListManager, metaclass=Singleton):
@@ -812,7 +1188,7 @@ class SCFlareListManager(FlareListManager, metaclass=Singleton):
             dtype=np.int64,
         )
 
-        data["lc_bgk_peak"] = Column(
+        data["lc_bkg_peak"] = Column(
             (
                 np.vstack(
                     (
@@ -912,22 +1288,25 @@ class SDCFlareListManager(FlareListManager, metaclass=Singleton):
 
     @classmethod
     def read_flarelist(cls, file, update=False):
-        """Reads or creates the LUT of all BSD RIDs and the request reason comment.
+        """Read the local flare-list CSV mirror, optionally refreshing it from the STIX Data Center.
 
-        On creation or update an api endpoint from the STIX data center is used
-        to get the information and persists as a LUT locally.
+        When ``update`` is set (or the file does not yet exist) the operational flare list is
+        fetched from the STIX Data Center via ``stixdcpy.fetch_flare_list`` in ~monthly chunks
+        (the API is batched by month and throttled, so the loop sleeps between chunks) from
+        2020-01-01 to now; an incremental update re-fetches the last ~60 days. The chunks are
+        concatenated, de-duplicated, sorted by ``peak_UTC`` and cached back to ``file``.
 
         Parameters
         ----------
         file : Path
-            path the to LUT file.
+            Path to the local flare-list CSV mirror.
         update : bool, optional
-            should the LUT be updated at start up?, by default False
+            Refresh from the STIX Data Center before reading, by default False.
 
         Returns
         -------
-        Table
-            the LUT od RIDs and request reasons.
+        `~pandas.DataFrame`
+            The full flare list.
         """
         if update or not file.exists():
             # the api is limited to batch sizes of a month. in order to get the full table we have
@@ -980,6 +1359,30 @@ class SDCFlareListManager(FlareListManager, metaclass=Singleton):
         return col["lc_peak"][0].value > CONFIG.getint("Processing", "flarelist_sdc_min_count", fallback=1000)
 
     def get_data(self, *, start, end, fido_client):
+        """Build the enriched SDC flare list for the ``[start, end)`` month.
+
+        Slices the requested month from the local CSV mirror and builds the base columns
+        (``flare_id``, the UTC time columns, GOES class/flux and the source quiet-period
+        background ``bkg_baseline`` / ``bkg_quiet_period``). It then enriches each flare with
+        the quicklook peak/background counts and fluxes
+        (`~stixcore.io.FlareListManager.FlareListManager.add_lc_bkg_columns`) and the quiet-time
+        background spectrum
+        (`~stixcore.io.FlareListManager.FlareListManager.add_background_file_column`). The
+        source CSV's own at-peak lightcurve counts and attenuator flag are unreliable and are
+        replaced by these STIX-derived values. See :doc:`/products/flarelist`.
+
+        Parameters
+        ----------
+        start, end : `~datetime.datetime`
+            Half-open month boundaries; flares with ``start <= start_UTC < end`` are kept.
+        fido_client : `~stixpy.net.client.STIXClient`
+            Client used to resolve the quicklook and CPD files during enrichment.
+
+        Returns
+        -------
+        tuple
+            ``(data, control, energy)`` QTables, or ``(None, None, None)`` if the month is empty.
+        """
         month_data = self.flarelist[
             (self.flarelist["start_UTC"] >= start.isoformat()) & (self.flarelist["start_UTC"] < end.isoformat())
         ]
@@ -1087,8 +1490,9 @@ class SDCFlareListManager(FlareListManager, metaclass=Singleton):
         # unreliable) using one monthly timeline per product built once.
         energy = self.add_lc_bkg_columns(data, start=start, end=end, fido_client=fido_client)
 
-        # select the best quiet-time background data file for each flare peak
-        self.add_background_file_column(data, fido_client=fido_client)
+        # select the best quiet-time background data file for each flare peak and extract
+        # its median quiet-period background spectrum (adds the 32-ch binning to `energy`)
+        energy = self.add_background_file_column(data, energy=energy, fido_client=fido_client)
 
         data.add_index("flare_id")
 

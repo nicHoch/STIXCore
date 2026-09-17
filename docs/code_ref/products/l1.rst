@@ -1,0 +1,10 @@
+Level 1 (L1)
+************
+
+Calibrated products in physical units with applied corrections.
+
+.. automodapi:: stixcore.products.level1.quicklookL1
+
+.. automodapi:: stixcore.products.level1.housekeepingL1
+
+.. automodapi:: stixcore.products.level1.scienceL1

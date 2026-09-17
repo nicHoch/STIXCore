@@ -11,15 +11,20 @@ import stixcore.io.FlareListManager as flm_mod
 from stixcore.io.FlareListManager import (
     BackgroundSelection,
     FlareListManager,
+    background_spectrum_from_cpd,
     build_month_timeline,
+    collecting_area_cm2,
     compute_ql_count_rate,
     find_background_file_for_time,
     max_rcr_in_window,
     nearest_bin_index,
+    rebin_flux_to_ql,
+    rebin_spectrum_to_ql,
 )
 from stixcore.io.RidLutManager import RidLutManager, search_background_candidates
 
 RATE_UNIT = u.ct / (u.s * u.keV)
+FLUX_UNIT = u.ct / (u.s * u.keV * u.cm**2)
 
 
 # --- helpers to build synthetic QL data ---------------------------------------
@@ -228,9 +233,10 @@ def test_add_lc_bkg_columns(flare_data, monkeypatch):
     assert flare_data["lc_peak"].shape == (3, 5)
     assert flare_data["lc_peak"].unit == u.ct
     assert np.all(flare_data["lc_peak"].value == np.round(flare_data["lc_peak"].value))
-    assert flare_data["lc_peak_rate"].unit.is_equivalent(RATE_UNIT)
-    assert flare_data["lc_bgk_peak"].shape == (3, 5)
-    assert flare_data["lc_bgk_peak"].unit == u.ct
+    assert flare_data["lc_peak_flux"].unit.is_equivalent(FLUX_UNIT)
+    assert flare_data["lc_bkg_peak_flux"].unit.is_equivalent(FLUX_UNIT)
+    assert flare_data["lc_bkg_peak"].shape == (3, 5)
+    assert flare_data["lc_bkg_peak"].unit == u.ct
     assert flare_data["att_in"].dtype == bool
     assert flare_data["energy_index"].dtype == np.int8
 
@@ -248,7 +254,7 @@ def test_add_lc_bkg_columns(flare_data, monkeypatch):
 
     # counts pulled from the real timeline for in-range flares
     assert np.all(flare_data["lc_peak"][0].to_value(u.ct) == 100)
-    assert np.all(flare_data["lc_bgk_peak"][0].to_value(u.ct) == 100)
+    assert np.all(flare_data["lc_bkg_peak"][0].to_value(u.ct) == 100)
 
     # returned energy table schema
     assert set(energy.colnames) == {"channel", "e_low", "e_high", "index"}
@@ -264,11 +270,45 @@ def test_add_lc_bkg_columns_no_files(flare_data, monkeypatch):
     )
 
     assert np.all(flare_data["lc_peak"].to_value(u.ct) == 0)
-    assert np.all(flare_data["lc_bgk_peak"].to_value(u.ct) == 0)
+    assert np.all(flare_data["lc_bkg_peak"].to_value(u.ct) == 0)
     assert np.all(flare_data["rcr_at_peak"] == -1)
     assert np.all(flare_data["rcr_max"] == -1)
     assert not np.any(flare_data["att_in"])
     assert len(energy) == 0
+
+
+def _energies_alt():
+    """A second, different QL energy binning (distinct edges -> distinct hash)."""
+    e = QTable()
+    e["channel"] = np.arange(5, dtype=np.uint8)
+    e["e_low"] = [4, 11, 16, 26, 51] * u.keV
+    e["e_high"] = [11, 16, 26, 51, 85] * u.keV
+    return e
+
+
+def test_energy_table_prunes_orphan_binning(flare_data, monkeypatch):
+    from datetime import date
+
+    # two LC products for the month with DIFFERENT binnings, both on the same date;
+    # date_to_eidx keeps the first (primary) binning, so the alternate block is an orphan.
+    n = 20
+    rcr = np.zeros(n, dtype=np.ubyte)
+    rcr[5:8] = 1
+    lc = FakeProduct(_ql_data("2024-06-15T12:00:00", n, rcr=rcr), _energies())
+    lc_alt = FakeProduct(_ql_data("2024-06-15T12:00:00", n, rcr=rcr), _energies_alt())
+    bkg = FakeProduct(_ql_data("2024-06-15T12:00:00", n, with_rcr=False), _energies())
+    products = {"lc": lc, "lc_alt": lc_alt, "bkg": bkg}
+    monkeypatch.setattr("stixcore.io.FlareListManager.STIXPYProduct", lambda path: products[path])
+    fido = FakeFido(lc_paths=["lc", "lc_alt"], bkg_paths=["bkg"])
+
+    energy = FlareListManager().add_lc_bkg_columns(
+        flare_data, start=date(2024, 6, 1), end=date(2024, 7, 1), fido_client=fido
+    )
+
+    # the orphan alternate block is dropped: only the single referenced 5-row block remains
+    assert len(energy) == 5
+    assert {int(x) for x in energy["index"]} == {0}
+    assert {int(x) for x in flare_data["energy_index"]} == {0}
 
 
 # --- background candidate search (RID LUT) ------------------------------------
@@ -602,8 +642,287 @@ def test_add_background_file_column_uses_valid_period_cache(monkeypatch):
     data["peak_UTC"] = Time(
         ["2023-06-15T00:00:00", "2023-06-16T00:00:00", "2023-06-18T00:00:00"]  # 3rd is beyond the 1st period
     )
-    FlareListManager().add_background_file_column(data, fido_client=object())
+    # STIXPYProduct isn't patched here; the missing "bkg.fits" is swallowed, leaving NaN spectra.
+    FlareListManager().add_background_file_column(data, energy=QTable(), fido_client=object())
 
     assert len(calls) == 2  # 1st + 3rd flare trigger a search; 2nd reuses the cache
     assert list(data["bkg_rid"]) == [42, 42, 42]
     assert list(data["bkg_file"]) == ["bkg.fits"] * 3
+
+
+# --- background-spectrum extraction ------------------------------------------
+
+
+def _sci_energies_32():
+    """The 32-channel science energy binning (channel/e_low/e_high in keV)."""
+    lows = [
+        0,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        18,
+        20,
+        22,
+        25,
+        28,
+        32,
+        36,
+        40,
+        45,
+        50,
+        56,
+        63,
+        70,
+        76,
+        84,
+        100,
+        120,
+        150,
+    ]
+    highs = [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        20,
+        22,
+        25,
+        28,
+        32,
+        36,
+        40,
+        45,
+        50,
+        56,
+        63,
+        70,
+        76,
+        84,
+        100,
+        120,
+        150,
+        1e6,
+    ]
+    e = QTable()
+    e["channel"] = np.arange(32, dtype=np.uint8)
+    e["e_low"] = lows * u.keV
+    e["e_high"] = highs * u.keV
+    return e
+
+
+class FakeCPD:
+    """CPD stand-in: builds a data table with counts + timedel + zero triggers
+    (livefrac=1) + pixel_masks (first npix pixels present) so the flux path runs."""
+
+    def __init__(self, counts, energies, control=None, timedel_s=1.0, dsun_m=1.496e11):
+        nt, ndet, npix, nE = counts.shape
+        d = QTable()
+        d["counts"] = counts
+        d["timedel"] = np.full(nt, timedel_s) * u.s
+        d["triggers"] = np.zeros((nt, 16))
+        pm = np.zeros((nt, 12), dtype=np.ubyte)
+        pm[:, :npix] = 1
+        d["pixel_masks"] = pm
+        self.data = d
+        self.energies = energies
+        self.control = control
+        self.meta = {"DSUN_OBS": dsun_m}  # SOLO-Sun distance (m), as in a CPD primary header
+
+
+class FakeCtrlProduct:
+    """Minimal product exposing a control table with detector/pixel masks."""
+
+    def __init__(self, detector_mask, pixel_mask):
+        c = QTable()
+        c["detector_mask"] = [np.asarray(detector_mask, dtype=np.ubyte)]
+        c["pixel_mask"] = [np.asarray(pixel_mask, dtype=np.ubyte)]
+        self.control = c
+
+
+def test_collecting_area_cm2():
+    # 30 imaging detectors, all 12 pixels -> 30 * sum(12 pixel areas)
+    det = np.ones(32, dtype=np.ubyte)
+    det[[8, 9]] = 0
+    from stixcore.io.FlareListManager import _pixel_area_cm2
+
+    a_full = collecting_area_cm2(FakeCtrlProduct(det, np.ones(12)))
+    assert np.isclose(a_full, 30 * _pixel_area_cm2().sum())
+    # 8 large pixels only -> smaller
+    pm8 = np.zeros(12, dtype=np.ubyte)
+    pm8[:8] = 1
+    a8 = collecting_area_cm2(FakeCtrlProduct(det, pm8))
+    assert np.isclose(a8, 30 * _pixel_area_cm2()[:8].sum())
+    assert a8 < a_full
+    # no masks -> None
+    assert collecting_area_cm2(FakeCPD(np.ones((1, 32, 12, 5)) * u.ct, _energies())) is None
+
+
+def test_background_spectrum_from_cpd():
+    from stixcore.io.FlareListManager import _pixel_area_cm2
+
+    nt = 5
+    counts = np.ones((nt, 32, 12, 32), dtype=float)
+    for t in range(nt):
+        counts[t] *= t + 1  # time-varying so the median is exercised
+    counts[:, 8] = 9999  # CFL detector - must be excluded
+    counts[:, 9] = 9999  # BKG monitor - must be excluded
+    spec, flux, e32 = background_spectrum_from_cpd(FakeCPD(counts * u.ct, _sci_energies_32(), timedel_s=1.0))
+    # counts: 30 imaging dets * 12 pixels * (t+1) -> [360..1800]; median = 1080
+    assert spec.shape == (32,)
+    assert spec.unit == u.ct
+    assert np.allclose(spec.to_value(u.ct), 1080.0)
+    assert len(e32) == 32
+    # flux = counts / (exp * area * dE); triggers=0 -> livefrac=1, timedel=1s
+    #  exp = 30 dets * 1s = 30; area = sum(12 pixel areas)
+    dE = e32["e_high"].to_value(u.keV) - e32["e_low"].to_value(u.keV)
+    area = _pixel_area_cm2().sum()
+    expected = 1080.0 / (30.0 * area * dE)
+    assert flux.shape == (32,)
+    assert flux.unit.is_equivalent(FLUX_UNIT)
+    assert np.allclose(flux.to_value(FLUX_UNIT), expected, rtol=1e-6)
+
+
+def test_background_spectrum_from_cpd_ragged_energies():
+    # real archive CPDs telemeter a subset of channels (e.g. 20) with fewer pixels (8);
+    # counts nE must stay aligned to the energies table (no forced 32-channel expansion)
+    energies = _sci_energies_32()[:20]  # 20-channel binning
+    counts = np.ones((4, 32, 8, 20), dtype=float)
+    counts[:, 8] = 5.0  # CFL - excluded
+    counts[:, 9] = 5.0  # BKG monitor - excluded
+    spec, flux, e = background_spectrum_from_cpd(FakeCPD(counts * u.ct, energies))
+    assert spec.shape == (20,)  # matches energies, not forced to 32
+    assert len(e) == 20
+    assert np.allclose(spec.to_value(u.ct), 30 * 8)  # 30 imaging dets * 8 pixels * 1 count
+    assert flux.shape == (20,)
+    assert np.all(np.isfinite(flux.to_value(FLUX_UNIT)))
+    # rebin against a QL block works (lengths consistent) and preserves units
+    c5 = rebin_spectrum_to_ql(spec, e, _energies())
+    assert c5.shape == (5,)
+    assert c5.unit == u.ct
+    assert c5.to_value(u.ct)[0] == 6 * (30 * 8)  # 4-10 keV -> 6 sci channels
+    f5 = rebin_flux_to_ql(flux, e, _energies())
+    assert f5.shape == (5,)
+    assert f5.unit.is_equivalent(FLUX_UNIT)
+    assert np.isfinite(f5.to_value(FLUX_UNIT)[0])
+
+
+def test_rebin_flux_to_ql():
+    e32 = _sci_energies_32()
+    # constant flux density -> dE-weighted mean is the same constant in every band
+    flux = np.full(32, 3.0)
+    f5 = rebin_flux_to_ql(flux, e32, _energies())
+    assert np.allclose(f5, 3.0)
+    # a shifted top band changes the channel set but a constant stays constant;
+    # use a ramp to show band membership matters
+    flux2 = np.arange(32, dtype=float)
+    a = rebin_flux_to_ql(flux2, e32, _energies())
+    ql2 = _energies()
+    ql2["e_high"] = [10, 15, 25, 50, 100] * u.keV
+    b = rebin_flux_to_ql(flux2, e32, ql2)
+    assert a[4] != b[4]  # 50-84 vs 50-100 include different channels
+
+
+def test_rebin_spectrum_to_ql():
+    e32 = _sci_energies_32()
+    counts32 = np.arange(32, dtype=float)  # channel c contributes c counts
+    ql = _energies()  # QL bands read from the (energy) table, not hardcoded
+    c5 = rebin_spectrum_to_ql(counts32, e32, ql)
+    assert c5[0] == sum(range(1, 7))  # 4-10 keV -> ch 1..6
+    assert c5[1] == sum(range(7, 12))  # 10-15   -> ch 7..11
+    assert c5[2] == sum(range(12, 17))  # 15-25   -> ch 12..16
+    assert c5[3] == sum(range(17, 23))  # 25-50   -> ch 17..22
+    assert c5[4] == sum(range(23, 28))  # 50-84   -> ch 23..27
+
+    # a shifted top band (50-100) must pull in channel 28 (84-100): proves it follows the table
+    ql2 = _energies()
+    ql2["e_high"] = [10, 15, 25, 50, 100] * u.keV
+    c5b = rebin_spectrum_to_ql(counts32, e32, ql2)
+    assert c5b[4] == sum(range(23, 29))
+    assert c5b[4] != c5[4]
+
+
+def test_add_background_file_column_extracts_and_caches(monkeypatch):
+    t0 = "2024-10-01T00:00:00"
+    T0 = Time(t0)
+    data = QTable()
+    data["flare_id"] = [1, 2, 3, 4]
+    data["peak_UTC"] = Time([t0, "2024-10-01T01:00:00", "2024-10-01T02:00:00", "2024-10-01T05:00:00"])
+    data["energy_index"] = np.zeros(4, dtype=np.int8)  # all reference the QL block (index 0)
+
+    energy = _energies()
+    energy["index"] = np.zeros(5, dtype=np.int8)  # QL 5-ch block, index 0
+
+    def fake_find(time, *, fido_client, **kwargs):
+        if time <= T0 + 1.5 * u.h:
+            return BackgroundSelection(path="cpdA", rid=100, valid_from=T0, valid_to=T0 + 1.5 * u.h)
+        if time <= T0 + 3.5 * u.h:
+            return BackgroundSelection(path="cpdB", rid=200, valid_from=T0 + 1.5 * u.h, valid_to=T0 + 3.5 * u.h)
+        return BackgroundSelection(path=None, rid=-1, valid_from=time, valid_to=time + 1 * u.h)
+
+    monkeypatch.setattr(flm_mod, "find_background_file_for_time", fake_find)
+
+    opens = []
+
+    dsun_by_path = {"cpdA": 0.5 * 1.495978707e11, "cpdB": 0.8 * 1.495978707e11}  # m
+
+    def fake_product(path):
+        opens.append(path)
+        return FakeCPD(np.ones((3, 32, 12, 32)) * u.ct, _sci_energies_32(), dsun_m=dsun_by_path[path])
+
+    monkeypatch.setattr(flm_mod, "STIXPYProduct", fake_product)
+
+    energy = FlareListManager().add_background_file_column(data, energy=energy, fido_client=object())
+
+    # each CPD opened exactly once (cpdA shared by flares 0 & 1; cpdB flare 2; flare 3 has no file)
+    assert opens == ["cpdA", "cpdB"]
+    assert list(data["bkg_rid"]) == [100, 100, 200, -1]
+    # both CPDs share the same 32-ch binning -> one new block (index 1); QL block stays index 0
+    assert {int(x) for x in energy["index"]} == {0, 1}
+    assert int(np.sum(np.asarray(energy["index"]) == 1)) == 32
+    assert list(data["bkg_energy_index"]) == [1, 1, 1, -1]
+    # counts spectra filled for in-file flares, NaN for the no-file flare
+    assert data["bkg_spec"].shape == (4, 32)
+    assert not np.isnan(data["bkg_spec"][0].to_value(u.ct)).any()
+    assert np.isnan(data["bkg_spec"][3].to_value(u.ct)).all()
+    assert np.allclose(data["bkg_spec"][0].to_value(u.ct), 360.0)  # 30 dets * 12 pix * 1
+    # counts rebinned to the QL bands
+    assert data["bkg_spec_ql"].shape == (4, 5)
+    assert data["bkg_spec_ql"].unit == u.ct
+    assert not np.isnan(data["bkg_spec_ql"][0].to_value(u.ct)).any()
+    assert np.isnan(data["bkg_spec_ql"][3].to_value(u.ct)).all()
+    # each QL band sums whole native channels (360 ct each), so every band is a multiple of 360
+    assert np.allclose(data["bkg_spec_ql"][0].to_value(u.ct) % 360.0, 0.0)
+    # flux columns (ct/s/keV/cm2), native + QL-rebinned
+    assert data["bkg_spec_flux"].shape == (4, 32)
+    assert data["bkg_spec_flux"].unit.is_equivalent(FLUX_UNIT)
+    assert not np.isnan(data["bkg_spec_flux"][0].to_value(FLUX_UNIT)).any()
+    assert np.isnan(data["bkg_spec_flux"][3].to_value(FLUX_UNIT)).all()
+    assert data["bkg_spec_flux_ql"].shape == (4, 5)
+    assert not np.isnan(data["bkg_spec_flux_ql"][0].to_value(FLUX_UNIT)).any()
+    assert np.isnan(data["bkg_spec_flux_ql"][3].to_value(FLUX_UNIT)).all()
+    # bkg_solo_sun_distance read from each CPD's DSUN_OBS header (km); NaN for the no-file flare
+    d = data["bkg_solo_sun_distance"].to_value(u.AU)
+    assert np.isclose(d[0], 0.5)
+    assert np.isclose(d[1], 0.5)
+    assert np.isclose(d[2], 0.8)
+    assert np.isnan(d[3])

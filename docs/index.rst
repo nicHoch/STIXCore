@@ -8,6 +8,7 @@ This is the documentation for STIXCore.
 
    whatsnew/index
    users
+   products/flarelist
    developers
    code_ref/index
    pipelineconfiguration

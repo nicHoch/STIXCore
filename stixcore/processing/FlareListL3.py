@@ -54,19 +54,19 @@ class FlareListL3(SingleProductProcessingStepMixin):
         return fl_months
 
     def test_for_processing(self, month: date, phm: ProcessingHistoryStorage) -> TestForProcessingResult:
-        """_summary_
+        """Decide whether the flare list for ``month`` needs (re)processing.
 
         Parameters
         ----------
-        candidate : Path
-            a fits file candidate
+        month : date
+            the month to test
         phm : ProcessingHistoryStorage
             the processing history persistent handler
 
         Returns
         -------
         TestForProcessingResult
-         what should happen with the candidate in the next processing step
+         what should happen with the month in the next processing step
         """
         try:
             wp = phm.has_processed_fits_products(

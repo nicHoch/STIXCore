@@ -25,7 +25,7 @@ from stixcore.processing.LL import LL03QL
 from stixcore.processing.pipeline import PipelineStatus
 from stixcore.processing.SingleStep import SingleProcessingStepResult
 from stixcore.products.level1.quicklookL1 import LightCurve
-from stixcore.products.level3.flarelist import FlarelistSDC, FlarelistSDCLoc
+from stixcore.products.level3.flarelist import FlarelistSDC, FlarelistSDCLocation
 from stixcore.products.lowlatency.quicklookLL import LightCurveL3
 from stixcore.soop.manager import SOOPManager
 from stixcore.util.logging import STX_LOGGER_DATE_FORMAT, STX_LOGGER_FORMAT, get_logger
@@ -248,10 +248,10 @@ def run_daily_pipeline(args):
             fits_in_dir,
             fits_out_dir,
             products_in_out=[
-                (FlarelistSDC, FlarelistSDCLoc),
-                # (FlarelistSDCLoc, FlarelistSDCLocImg),
-                # (FlarelistSC, FlarelistSCLoc),
-                # (FlarelistSCLoc, FlarelistSCLocImg),
+                (FlarelistSDC, FlarelistSDCLocation),
+                # (FlarelistSDCLocation, FlarelistSDCLocationImage),
+                # (FlarelistSC, FlarelistSCLocation),
+                # (FlarelistSCLocation, FlarelistSCLocationImage),
             ],
             cadence=timedelta(seconds=1),
         )
@@ -274,7 +274,8 @@ def run_daily_pipeline(args):
 
         # TODO reactivate once flarelist processing is finalized
         fl_sdc_months = flarelist_sdc.find_processing_months(phs)
-        # fl_sdc_months = []
+        fl_sdc_months = []
+        # fl_sdc_months = [f for f in fl_sdc_months if f.year == 2024 and f.month == 10]
 
         # TODO reactivate once flarelist processing is finalized
         # fl_sc_months = flarelist_sc.find_processing_months(phs)
@@ -284,8 +285,7 @@ def run_daily_pipeline(args):
         fl_to_fl_files = fl_to_fl.get_processing_files(phs)
         # fl_to_fl_files = fl_to_fl_files[2:-1]
         # fl_to_fl_files = []
-
-        fl_to_fl_files = [f for f in fl_to_fl_files if "/2024/" in str(f[2])]
+        fl_to_fl_files = [f for f in fl_to_fl_files if "/2024/10/" in str(f[2]) and "V04" in str(f[2])]
 
         # all processing files should be terminated before the next step as the different
         # processing steeps might create new candidates

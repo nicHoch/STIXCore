@@ -2,32 +2,30 @@ STIXCore Products
 *****************
 
 The ``products`` submodule contains processing classes representing high level
-data products create from multiple packets with additional checks.
+data products created from multiple packets with additional checks.
+
+The products are organized by processing level (``LB`` raw binary, ``L0``-``L3``)
+and by product category (``ANC`` ancillary, ``CAL`` calibration):
+
+.. toctree::
+   :maxdepth: 2
+
+   products/lb
+   products/l0
+   products/l1
+   products/l2
+   products/l3
+   products/ll
+   products/anc
+   products/cal
 
 
-.. automodapi:: stixcore.products
+Base classes
+============
 
-.. automodapi:: stixcore.products.common
+Shared base classes and helpers used by all product levels.
 
 .. automodapi:: stixcore.products.product
     :include-all-objects:
 
-.. automodapi:: stixcore.products.levelb
-
-.. automodapi:: stixcore.products.levelb.binary
-
-.. automodapi:: stixcore.products.level0.quicklookL0
-
-.. automodapi:: stixcore.products.level1.quicklookL1
-
-.. automodapi:: stixcore.products.level0.housekeepingL0
-
-.. automodapi:: stixcore.products.level1.housekeepingL1
-
-.. automodapi:: stixcore.products.level0.scienceL0
-
-.. automodapi:: stixcore.products.level1.scienceL1
-
-.. automodapi:: stixcore.products.level2.housekeepingL2
-
-.. automodapi:: stixcore.products.level2.quicklookL2
+.. automodapi:: stixcore.products.common

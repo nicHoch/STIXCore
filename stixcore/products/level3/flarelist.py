@@ -1,6 +1,7 @@
 from pathlib import Path
 from datetime import datetime
 from itertools import groupby
+from collections import namedtuple
 
 import numpy as np
 from stixpy.calibration.visibility import (
@@ -28,7 +29,7 @@ from stixcore.config.config import CONFIG
 from stixcore.ephemeris.manager import Spice
 from stixcore.products.level3.flarelistproduct import PeakPreviewImage
 from stixcore.products.level3.processing import stx_estimate_flare_location
-from stixcore.products.product import CountDataMixin, GenericProduct, L2Mixin, read_qtable
+from stixcore.products.product import CountDataMixin, GenericProduct, L2Mixin
 from stixcore.soop.manager import SOOPManager
 from stixcore.time import SCETime, SCETimeRange
 from stixcore.util.logging import get_logger
@@ -41,11 +42,13 @@ __all__ = [
     "FlarePositionMixin",
     "FlareSOOPMixin",
     "FlareList",
-    "FlarelistSDCLocImg",
+    "FlarelistSDCLocation",
+    "FlarelistSDCLocationImage",
     "FlarePeakPreviewMixin",
     "FlarelistSC",
-    "FlarelistSCLoc",
-    "FlarelistSCLocImg",
+    "FlarelistSCLocation",
+    "FlarelistSCLocationImage",
+    "add_distance_normalized_flux",
 ]
 
 logger = get_logger(__name__)
@@ -78,6 +81,106 @@ def make_stix_fitswcs_header(data, flare_position, *, scale, exposure, rotation_
     return header
 
 
+#: Which per-flare distance column each flux column is normalized by. LC peak fluxes use the
+#: flare-time SOLO distance; the quiet-period background fluxes use the background CPD's own time.
+_FLUX_DISTANCE_COLS = {
+    "lc_peak_flux": "solo_sun_distance",
+    "lc_bkg_peak_flux": "solo_sun_distance",
+    "bkg_spec_flux": "bkg_solo_sun_distance",
+    "bkg_spec_flux_ql": "bkg_solo_sun_distance",
+}
+
+
+def add_distance_normalized_flux(data, mapping=_FLUX_DISTANCE_COLS):
+    """Add ``<col>_at_1au`` = ``<col> * (r/1AU)**2`` for each present flux column, using the
+    per-flare distance in its mapped column (flux scales as 1/r**2).
+
+    The existing flux columns are kept unchanged; the scale factor is dimensionless so the
+    ``*_at_1au`` columns keep the flux unit (ct/s/keV/cm2). NaN distance -> NaN; a flux column
+    (or its distance column) that is absent is skipped.
+    """
+    for col, dist_col in mapping.items():
+        if col not in data.colnames or dist_col not in data.colnames:
+            continue
+        factor = (data[dist_col] / (1 * u.AU)).decompose().value ** 2  # (N,), dimensionless
+        f = data[col]
+        data[col + "_at_1au"] = f * (factor[:, None] if f.ndim == 2 else factor)
+        data[
+            col + "_at_1au"
+        ].info.description = f"{col} scaled to what would be seen at 1 AU (x (r_solo/1AU)**2, r_solo from {dist_col})"
+
+
+#: Per-flare result of :meth:`FlarePositionMixin.add_flare_position`. One record per flare row;
+#: skipped/failed flares use :func:`_empty_flare_position` (NaN geometry, ``peak_time`` placeholder).
+FlarePositionResult = namedtuple(
+    "FlarePositionResult",
+    [
+        "anc_path",
+        "cpd_path",
+        "status",
+        "message",
+        "flare_x",  # HGS cartesian, km
+        "flare_y",
+        "flare_z",
+        "solo_time",  # location time center
+        "duration",  # location window length
+        "solo_x",  # SOLO HGS cartesian, km
+        "solo_y",
+        "solo_z",
+        "rcr_at_peak",
+        "sidelobe",
+        "min_exposure",  # CPD per-bin exposure ds over the flare window (u.ds)
+        "max_exposure",
+    ],
+)
+
+
+def _empty_flare_position(solo_time, **overrides):
+    """A :class:`FlarePositionResult` for a skipped/failed flare.
+
+    NaN geometry and zero window, with ``solo_time`` kept as the per-row time placeholder (it
+    must stay a valid `~astropy.time.Time` for the downstream coordinate/Spice handling).
+    ``overrides`` set the few fields a given skip site knows, e.g. ``message`` / ``anc_path`` /
+    ``cpd_path``.
+    """
+    base = dict(
+        anc_path="",
+        cpd_path="",
+        status=False,
+        message="",
+        flare_x=np.nan * u.km,
+        flare_y=np.nan * u.km,
+        flare_z=np.nan * u.km,
+        solo_time=solo_time,
+        duration=0 * u.s,
+        solo_x=np.nan * u.km,
+        solo_y=np.nan * u.km,
+        solo_z=np.nan * u.km,
+        rcr_at_peak=0,
+        sidelobe=np.nan,
+        min_exposure=np.nan * u.ds,
+        max_exposure=np.nan * u.ds,
+    )
+    base.update(overrides)
+    return FlarePositionResult(**base)
+
+
+def cpd_timedel_range(times, timedels, start, end):
+    """Min and max CPD time-step ``ds`` (``timedel``) for bins overlapping ``[start, end]``.
+
+    Uses the same half-bin overlap test as the peak-window selection so partially covered
+    windows still contribute. Returns ``(min_exposure, max_exposure)`` as
+    `~astropy.units.Quantity` in deciseconds (``u.ds``, STIX's native ``timedel`` unit);
+    ``(NaN ds, NaN ds)`` if no bin overlaps.
+    """
+    half = timedels / 2
+    mask = (times + half >= start) & (times - half <= end)
+    sel = timedels[mask]
+    if len(sel) == 0:
+        return np.nan * u.ds, np.nan * u.ds
+    return sel.min().to(u.ds), sel.max().to(u.ds)
+
+
 class _SerializeMixin:
     """No-op chain terminator for on_serialize/on_deserialize.
 
@@ -93,7 +196,19 @@ class _SerializeMixin:
 
 
 class FlarePositionMixin(_SerializeMixin):
-    """_summary_"""
+    """Mixin adding a STIX-derived flare location to a flare-list product.
+
+    For every flare it selects a compressed-pixel-data (CPD) file, estimates the source
+    position by back-projection imaging (`~stixcore.products.level3.processing.stx_estimate_flare_location`),
+    and stores the location (Heliographic Stonyhurst / Helioprojective), the Solar Orbiter
+    position and distance, an imaging-quality metric and related timing columns. On
+    serialization the location columns are converted to ICRS (and back on deserialization) so
+    they survive the FITS round-trip.
+
+    See :doc:`/products/flarelist` for the CPD-selection and imaging details. Used by
+    `~stixcore.products.level3.flarelist.FlarelistSDCLocation` (and the image product built on
+    it).
+    """
 
     @classmethod
     def add_flare_position(
@@ -109,11 +224,30 @@ class FlarePositionMixin(_SerializeMixin):
         keep_all_flares=True,
         month=None,
     ):
-        anc_ephemeris_paths = []
-        cpd_paths = []
-        position_statuses = []
-        position_messages = []
-        solo_cartesian_list = []
+        """Estimate and add the flare location columns for every flare in ``data``.
+
+        For each flare passing ``filter_function`` the daily ancillary ephemeris and the
+        science CPD file(s) covering ``[start, end]`` are looked up; the best CPD is scored and
+        selected, a constant-``rcr`` time window around the peak is chosen, and the location is
+        estimated by back-projection imaging. See :doc:`/products/flarelist` for the selection
+        and imaging parameters.
+
+        Parameters
+        ----------
+        data : `~astropy.table.QTable`
+            The flare list; location columns are added in place.
+        fido_client : `~stixpy.net.client.STIXClient`
+            Client used to search for the ephemeris and CPD files.
+        filter_function : callable, optional
+            ``row -> bool`` deciding which flares to process (default: all).
+        peak_time_colname, start_time_colname, end_time_colname, location_time_colname : str
+            Names of the time columns to read / write.
+        keep_all_flares : bool, optional
+            If False, flares that did not pass ``filter_function`` are removed from ``data``.
+        month : optional
+            Month being processed, used for logging only.
+        """
+        position_results = []
 
         to_remove = []
         pass_filter = 0
@@ -126,10 +260,6 @@ class FlarePositionMixin(_SerializeMixin):
         day_asp_ephemeris_cache = dict()
 
         for i, row in enumerate(data):
-            _anc_path = ""
-            _cpd_path = ""
-            _status = False
-            _message = ""
             peak_time = row[peak_time_colname]
             start_time = row[start_time_colname]
             end_time = row[end_time_colname]
@@ -151,93 +281,56 @@ class FlarePositionMixin(_SerializeMixin):
 
                 if len(anc_res) < 1:
                     logger.warning(f"No ephemeris data found for flare at time {start_time} : {end_time}")
-                    _message = "no ephemeris data found"
                     no_ephemeris += 1
-                    solo_cartesian_list.append(
-                        (
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            peak_time,
-                            0 * u.s,
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            0,
-                            np.nan,
-                        )
-                    )
-                    anc_ephemeris_paths.append(_anc_path)
-                    cpd_paths.append(_cpd_path)
-                    position_statuses.append(_status)
-                    position_messages.append(_message)
+                    position_results.append(_empty_flare_position(peak_time, message="no ephemeris data found"))
                     continue
                 _anc_path = str(anc_res["path"][0])
 
-                if start_time.datetime.hour < 2:
-                    start_time = start_time - 2 * u.hour
+                # widen only the FIDO search window near midnight; keep the true flare start_time
+                search_start = start_time - 2 * u.hour if start_time.datetime.hour < 2 else start_time
                 cpd_res = fido_client.search(
-                    a.Time(start_time, end_time), a.Instrument.stix, a.stix.DataProduct.sci_xray_cpd
+                    a.Time(search_start, end_time), a.Instrument.stix, a.stix.DataProduct.sci_xray_cpd
                 )
                 if cpd_res:
                     cpd_res.filter_for_latest_version()
                 url_to_path(cpd_res)
 
                 if len(cpd_res) < 1:
-                    logger.warning(f"No CPD data found for flare at time {start_time} : {end_time}")
-                    _message = "no CPD data found"
+                    logger.warning(f"No CPD data found for flare at time {search_start} : {end_time}")
                     no_cpd += 1
-                    solo_cartesian_list.append(
-                        (
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            peak_time,
-                            0 * u.s,
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            0,
-                            np.nan,
-                        )
+                    position_results.append(
+                        _empty_flare_position(peak_time, anc_path=_anc_path, message="no CPD data found")
                     )
-                    anc_ephemeris_paths.append(_anc_path)
-                    cpd_paths.append(_cpd_path)
-                    position_statuses.append(_status)
-                    position_messages.append(_message)
                     continue
                 if len(cpd_res) > 1:
-                    logger.debug(f"Many CPD data found for flare at time {start_time} : {end_time}")
-                    # select the best available CPD data file
-                    cpd_res["inc_peak"] = np.logical_and(
-                        peak_time >= cpd_res["Start Time"], peak_time <= cpd_res["End Time"]
-                    )
-                    cpd_res["file_size"] = [path.stat().st_size for path in cpd_res["path"]]
-                    cpd_res["exposure"] = 0.0
-                    cpd_res["duration"] = 0.0
-                    cpd_res["tbins"] = 0
-                    cpd_res["ebins"] = 0
-                    cpd_res["estart"] = 0.0
-                    cpd_res["eend"] = 0.0
-                    cpd_res["maxcount"] = 0
+                    logger.debug(f"Many CPD data found for flare at time {search_start} : {end_time}")
+                    # select the best available CPD data file (full product read per candidate)
+                    cpd_res["inc_peak"] = False  # flare peak time inside the file
+                    cpd_res["inc_flare"] = 0.0  # % of the flare duration covered by the file
+                    cpd_res["min_dt"] = np.inf  # min time resolution (ds) during the flare; inf if no overlap
+                    cpd_res["ebins"] = 0  # number of energy bins (energy table)
                     many_cpd += 1
 
-                    for i, path in enumerate(cpd_res["path"]):
-                        header = fits.getheader(path)
-                        header_data = fits.getheader(path, "DATA")
-                        energies = read_qtable(path, "ENERGIES")
-                        cpd_res["maxcount"][i] = header["DATAMAX"]
-                        cpd_res["exposure"][i] = header["XPOSURE"]
-                        cpd_res["tbins"][i] = header_data["NAXIS2"]
-                        cpd_res["ebins"][i] = len(energies)
-                        cpd_res["estart"][i] = energies["e_low"][0].value
-                        cpd_res["eend"][i] = (
-                            energies["e_high"][-1].value if len(energies) < 31 else energies["e_high"][-2].value
-                        )
-                        cpd_res["duration"][i] = header["OBT_END"] - header["OBT_BEG"]
+                    flare_dur_s = (end_time - start_time).sec  # flare duration in seconds
+                    for ci, path in enumerate(cpd_res["path"]):
+                        cpd = STIXPYProduct(Path(path))
+                        # FIDO reports Start/End Time as strings; parse to Time for arithmetic
+                        file_start = Time(cpd_res["Start Time"][ci])
+                        file_end = Time(cpd_res["End Time"][ci])
+                        cpd_res["inc_peak"][ci] = file_start <= peak_time <= file_end
+                        # percentage of the flare [start_time, end_time] duration covered by the file
+                        overlap_s = (min(file_end, end_time) - max(file_start, start_time)).sec
+                        cpd_res["inc_flare"][ci] = 100.0 * max(0.0, overlap_s) / flare_dur_s if flare_dur_s > 0 else 0.0
+                        # shortest time resolution among bins overlapping the flare (shorter is better)
+                        dt_min, _ = cpd_timedel_range(cpd.data["time"], cpd.data["timedel"], start_time, end_time)
+                        cpd_res["min_dt"][ci] = dt_min.to_value(u.ds) if np.isfinite(dt_min.value) else np.inf
+                        cpd_res["ebins"][ci] = len(cpd.energies)
 
+                    # best = peak inside, then most flare coverage, then shortest time resolution,
+                    # then most energy bins. shorter min_dt is better, so sort on its negative.
                     # TODO: add more criteria to select the best CPD file
-                    cpd_res.sort(["inc_peak", "tbins", "duration"], reverse=True)
+                    cpd_res["_neg_min_dt"] = -cpd_res["min_dt"]
+                    cpd_res.sort(["inc_peak", "inc_flare", "_neg_min_dt", "ebins"], reverse=True)
                     # cpd_res.pprint()
                     best_cpd_idx = 0
                 else:
@@ -247,6 +340,12 @@ class FlarePositionMixin(_SerializeMixin):
 
                 try:
                     stixpy_cpd = STIXPYProduct(Path(_cpd_path))
+
+                    # CPD per-bin exposure (ds) over the full flare start..end window (partial overlap ok)
+                    min_exposure, max_exposure = cpd_timedel_range(
+                        stixpy_cpd.data["time"], stixpy_cpd.data["timedel"], start_time, end_time
+                    )
+
                     time_range = TimeRange(max(peak_time - 20 * u.s, start_time), min(peak_time + 20 * u.s, end_time))
                     overlaps = calculate_overlap(stixpy_cpd.time_range, time_range)
                     if overlaps is None:
@@ -296,66 +395,61 @@ class FlarePositionMixin(_SerializeMixin):
                         center_hgs = flare_loc.transform_to(
                             HeliographicStonyhurst(obstime=img_time_range.center)
                         ).cartesian
-                        solo_cartesian_list.append(
-                            (
-                                center_hgs.x,
-                                center_hgs.y,
-                                center_hgs.z,
-                                img_time_range.center,
-                                img_time_range.seconds,
-                                solo.x,
-                                solo.y,
-                                solo.z,
-                                rcr_at_peak,
-                                sidelobe,
+                        position_results.append(
+                            FlarePositionResult(
+                                anc_path=_anc_path,
+                                cpd_path=_cpd_path,
+                                status=True,
+                                message="OK",
+                                flare_x=center_hgs.x,
+                                flare_y=center_hgs.y,
+                                flare_z=center_hgs.z,
+                                solo_time=img_time_range.center,
+                                duration=img_time_range.seconds,
+                                solo_x=solo.x,
+                                solo_y=solo.y,
+                                solo_z=solo.z,
+                                rcr_at_peak=rcr_at_peak,
+                                sidelobe=sidelobe,
+                                min_exposure=min_exposure,
+                                max_exposure=max_exposure,
                             )
                         )
-
-                    _status = True
-                    _message = "OK"
                 except Exception as e:
-                    _status = False
-                    _message = f"Error: {type(e)}"
                     logger.warning(f"Error calculating flare position for flare at time {start_time} : {end_time}: {e}")
-                    solo_cartesian_list.append(
-                        (
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            peak_time,
-                            0 * u.s,
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            np.nan * u.km,
-                            0,
-                            np.nan,
+                    position_results.append(
+                        _empty_flare_position(
+                            peak_time, anc_path=_anc_path, cpd_path=_cpd_path, message=f"Error: {type(e)}"
                         )
                     )
-                anc_ephemeris_paths.append(_anc_path)
-                cpd_paths.append(_cpd_path)
-                position_statuses.append(_status)
-                position_messages.append(_message)
 
             else:
                 to_remove.append(i)
-                solo_cartesian_list.append(
-                    (
-                        np.nan * u.km,
-                        np.nan * u.km,
-                        np.nan * u.km,
-                        peak_time,
-                        0 * u.s,
-                        np.nan * u.km,
-                        np.nan * u.km,
-                        np.nan * u.km,
-                        0,
-                        np.nan,
-                    )
+                position_results.append(
+                    _empty_flare_position(peak_time, message="flare did not pass the filter function")
                 )
-                anc_ephemeris_paths.append(_anc_path)
-                cpd_paths.append(_cpd_path)
-                position_statuses.append(False)
-                position_messages.append("flare did not pass the filter function")
+
+        # transpose the per-flare records in one pass (a namedtuple is a tuple), field order must
+        # match FlarePositionResult
+        (
+            anc_ephemeris_paths,
+            cpd_paths,
+            position_statuses,
+            position_messages,
+            flare_x,
+            flare_y,
+            flare_z,
+            solo_times,
+            duration,
+            solo_x,
+            solo_y,
+            solo_z,
+            rcr_at_peak,
+            sidelobe,
+            min_exposure,
+            max_exposure,
+        ) = zip(*position_results)
+        solo_times = Time(solo_times)
 
         primer = fido_client.baseurl.replace(fido_client.datapath, "")
         primer = primer[7:] if primer.startswith("file://") else primer
@@ -371,11 +465,6 @@ class FlarePositionMixin(_SerializeMixin):
 
         data["_position_message"] = position_messages
         data["_position_message"].info.description = "Message describing the status of the flare position calculation"
-
-        flare_x, flare_y, flare_z, solo_times, duration, solo_x, solo_y, solo_z, rcr_at_peak, sidelobe = zip(
-            *solo_cartesian_list
-        )
-        solo_times = Time(solo_times)
 
         hgs_coords = SkyCoord(
             u.Quantity(flare_x),
@@ -402,6 +491,12 @@ class FlarePositionMixin(_SerializeMixin):
         data["solo_location_hgs"] = solo_coords
         data["solo_location_hgs"].info.description = "SOLO location in Heliographic Stonyhurst coordinates"
 
+        data["solo_sun_distance"] = solo_coords.cartesian.norm().to(u.km)
+        data["solo_sun_distance"].info.description = "distance of Solar Orbiter to Sun center"
+
+        # add 1-AU-normalized twins of the flux columns (flux ~ 1/r^2); keeps the originals
+        add_distance_normalized_flux(data)
+
         data["sidelobes_ratio"] = sidelobe
         data["sidelobes_ratio"].info.description = "Ratio of sidelobes in the STIX image used to assess imaging quality"
 
@@ -420,6 +515,15 @@ class FlarePositionMixin(_SerializeMixin):
 
         data["location_duration"] = duration
         data["location_duration"].info.description = "duration of the flare location estimation time range"
+
+        data["min_exposure"] = u.Quantity(min_exposure)  # unit u.ds (deciseconds)
+        data[
+            "min_exposure"
+        ].info.description = "minimum CPD per-bin exposure ds (timedel) over the flare start..end window"
+        data["max_exposure"] = u.Quantity(max_exposure)
+        data[
+            "max_exposure"
+        ].info.description = "maximum CPD per-bin exposure ds (timedel) over the flare start..end window"
 
         (
             time_shift,
@@ -508,12 +612,26 @@ class FlarePositionMixin(_SerializeMixin):
 
 
 class FlareSOOPMixin(_SerializeMixin):
-    """_summary_"""
+    """Mixin adding the Solar Orbiter observing-campaign (SOOP) columns to a flare list.
+
+    For each flare it queries `~stixcore.soop.manager.SOOPManager` for the campaign active at
+    the flare peak and stores its encoded type, instance id and name (``soop_encoded_type``,
+    ``soop_id``, ``soop_type``). Used by `~stixcore.products.level3.flarelist.FlarelistSDC`.
+    """
 
     @classmethod
     def add_soop(
         self, data, *, peak_time_colname="peak_UTC", start_time_colname="start_UTC", end_time_colname="end_UTC"
     ):
+        """Add the SOOP campaign columns for every flare in ``data`` (in place).
+
+        Parameters
+        ----------
+        data : `~astropy.table.QTable`
+            The flare list.
+        peak_time_colname, start_time_colname, end_time_colname : str
+            Names of the time columns; the campaign is looked up at ``peak_time_colname``.
+        """
         soop_encoded_type = list()
         soop_id = list()
         soop_type = list()
@@ -574,6 +692,9 @@ class FlarePeakPreviewMixin:
         keep_all_flares=True,
         month=None,
     ):
+        """Reconstruct and attach per-flare peak-preview CLEAN images (4-20 and 20-120 keV) for
+        each flare in ``data``, using its selected CPD file, writing one
+        `~stixcore.products.level3.flarelistproduct.PeakPreviewImage` product per flare."""
         data["peak_preview_path"] = Column(" " * 500, dtype=str, description="TDB")
         data["preview_start_UTC"] = [Time(d, format="isot", scale="utc") for d in data[peak_time_colname]]
         data["preview_end_UTC"] = [Time(d, format="isot", scale="utc") for d in data[peak_time_colname]]
@@ -783,12 +904,19 @@ class FlareList(CountDataMixin, GenericProduct, L2Mixin):
 
 
 class FlarelistSDC(FlareList, FlareSOOPMixin):
-    """Flarelist product class for StixDataCenter flares.
+    """Base SDC flare-list product (``NAME="sdc"``, ssid 2, level L3).
 
-    In L3 product format.
+    Mirrors the operational STIX Data Center flare list and enriches every flare with the
+    quicklook peak / quiet-time background counts and fluxes (added by
+    `~stixcore.io.FlareListManager.SDCFlareListManager`) and the SOOP campaign (via
+    `~stixcore.products.level3.flarelist.FlareSOOPMixin`). It is the first level of the SDC
+    chain: `~stixcore.products.level3.flarelist.FlarelistSDC` ->
+    `~stixcore.products.level3.flarelist.FlarelistSDCLocation` ->
+    `~stixcore.products.level3.flarelist.FlarelistSDCLocationImage`. See
+    :doc:`/products/flarelist`.
     """
 
-    PRODUCT_PROCESSING_VERSION = 3
+    PRODUCT_PROCESSING_VERSION = 4
     NAME = "sdc"
 
     def __init__(self, *, service_type=0, service_subtype=0, ssid=2, data, month, **kwargs):
@@ -838,19 +966,23 @@ class FlarelistSDC(FlareList, FlareSOOPMixin):
         return kwargs["level"] == "L3" and service_type == 0 and service_subtype == 0 and ssid == 2
 
 
-class FlarelistSDCLoc(FlarelistSDC, FlarePositionMixin):
-    """Flarelist product class for StixDataCenter flares.
+class FlarelistSDCLocation(FlarelistSDC, FlarePositionMixin):
+    """SDC flare list with a STIX-derived flare location (``NAME="sdcloc"``, ssid 3, level L3).
 
-    In ANC product format.
+    Extends `~stixcore.products.level3.flarelist.FlarelistSDC` with the flare position
+    (and SOLO position/distance, imaging-quality metric and 1-AU-normalized fluxes) via
+    `~stixcore.products.level3.flarelist.FlarePositionMixin`. Only flares above
+    ``[Processing] flarelist_sdc_min_count`` peak counts are located. See
+    :doc:`/products/flarelist`.
     """
 
-    PRODUCT_PROCESSING_VERSION = 3
+    PRODUCT_PROCESSING_VERSION = 4
     NAME = "sdcloc"
 
     def __init__(self, *, service_type=0, service_subtype=0, ssid=3, data, month, **kwargs):
         super().__init__(service_type=0, service_subtype=0, ssid=3, data=data, month=month, **kwargs)
 
-        self.name = FlarelistSDCLoc.NAME
+        self.name = FlarelistSDCLocation.NAME
         self.ssid = 3
         self.location_time_colname = "location_time_UTC"
 
@@ -879,19 +1011,22 @@ class FlarelistSDCLoc(FlarelistSDC, FlarePositionMixin):
         return kwargs["level"] == "L3" and service_type == 0 and service_subtype == 0 and ssid == 3
 
 
-class FlarelistSDCLocImg(FlarelistSDCLoc, FlarePeakPreviewMixin):
-    """Flarelist product class for StixDataCenter flares.
+class FlarelistSDCLocationImage(FlarelistSDCLocation, FlarePeakPreviewMixin):
+    """Located SDC flare list plus peak-preview images (``NAME="sdclocimg"``, ssid 4, level L3).
 
-    In ANC product format.
+    Extends `~stixcore.products.level3.flarelist.FlarelistSDCLocation` with per-flare
+    peak-preview CLEAN images (`~stixcore.products.level3.flarelistproduct.PeakPreviewImage`),
+    reconstructed on the same CPD file used for the flare location, via
+    `~stixcore.products.level3.flarelist.FlarePeakPreviewMixin`. See :doc:`/products/flarelist`.
     """
 
-    PRODUCT_PROCESSING_VERSION = 2
+    PRODUCT_PROCESSING_VERSION = 4
     NAME = "sdclocimg"
 
     def __init__(self, *, service_type=0, service_subtype=0, ssid=4, data, month, **kwargs):
         super().__init__(service_type=0, service_subtype=0, ssid=4, data=data, month=month, **kwargs)
 
-        self.name = FlarelistSDCLocImg.NAME
+        self.name = FlarelistSDCLocationImage.NAME
         self.ssid = 4
 
     def enhance_from_product(self, in_prod: GenericProduct):
@@ -976,7 +1111,7 @@ class FlarelistSC(FlareList, FlareSOOPMixin):
         return kwargs["level"] == "L3" and service_type == 0 and service_subtype == 0 and ssid == 6
 
 
-class FlarelistSCLoc(FlarelistSC, FlarePositionMixin):
+class FlarelistSCLocation(FlarelistSC, FlarePositionMixin):
     """Flarelist product class for STIXCore flares.
 
     In L3 product format.
@@ -988,7 +1123,7 @@ class FlarelistSCLoc(FlarelistSC, FlarePositionMixin):
     def __init__(self, *, service_type=0, service_subtype=0, ssid=7, data, month, **kwargs):
         super().__init__(service_type=0, service_subtype=0, ssid=7, data=data, month=month, **kwargs)
 
-        self.name = FlarelistSCLoc.NAME
+        self.name = FlarelistSCLocation.NAME
         self.ssid = 7
         self.peak_time_colname = "peak_UTC"
 
@@ -1017,7 +1152,7 @@ class FlarelistSCLoc(FlarelistSC, FlarePositionMixin):
         return kwargs["level"] == "L3" and service_type == 0 and service_subtype == 0 and ssid == 7
 
 
-class FlarelistSCLocImg(FlarelistSCLoc, FlarePeakPreviewMixin):
+class FlarelistSCLocationImage(FlarelistSCLocation, FlarePeakPreviewMixin):
     """Flarelist product class for StixCore flares.
 
     In ANC product format.
@@ -1029,7 +1164,7 @@ class FlarelistSCLocImg(FlarelistSCLoc, FlarePeakPreviewMixin):
     def __init__(self, *, service_type=0, service_subtype=0, ssid=8, data, month, **kwargs):
         super().__init__(service_type=0, service_subtype=0, ssid=8, data=data, month=month, **kwargs)
 
-        self.name = FlarelistSCLocImg.NAME
+        self.name = FlarelistSCLocationImage.NAME
         self.ssid = 8
 
     def enhance_from_product(self, in_prod: GenericProduct):

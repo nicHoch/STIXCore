@@ -1,0 +1,10 @@
+Level 2 (L2)
+************
+
+Higher-level calibrated products.
+
+.. automodapi:: stixcore.products.level2.quicklookL2
+
+.. automodapi:: stixcore.products.level2.housekeepingL2
+
+.. automodapi:: stixcore.products.level2.scienceL2

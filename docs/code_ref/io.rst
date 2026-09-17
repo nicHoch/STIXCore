@@ -6,6 +6,9 @@ to certain directories.
 
 .. automodapi:: stixcore.io
 
+.. automodapi:: stixcore.io.FlareListManager
+    :skip: SCFlareListManager
+
 .. automodapi:: stixcore.io.product_processors.fits.processors
 .. automodapi:: stixcore.io.product_processors.plots.processors
 

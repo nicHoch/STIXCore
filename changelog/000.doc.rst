@@ -1,0 +1,1 @@
+Documented the SDC level-3 flare list: `~stixcore.products.level3.flarelist` and `~stixcore.io.FlareListManager` are now part of the API reference, and a new guide describes how the flare list is built from the STIX Data Center flare list and enriched (quiet-time background selection, CPD-file selection and flare-location imaging).

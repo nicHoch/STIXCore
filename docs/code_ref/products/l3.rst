@@ -1,0 +1,10 @@
+Level 3 (L3)
+************
+
+Level-3 products are higher-level science products derived from the lower levels.
+All current L3 products belong to the flare list.
+
+.. toctree::
+   :maxdepth: 1
+
+   l3_flarelist
