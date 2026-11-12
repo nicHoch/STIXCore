@@ -1,0 +1,17 @@
+# Requirements of the STIX L3 flare list showcase notebook (STIX_L3_flarelist_showcase.ipynb)
+# Python 3.12 or newer (as stixpy). Install with:  pip install -r requirements.txt
+# Tested with python 3.12, numpy 2.3, astropy 8.0, sunpy 8.0, matplotlib 3.11, pandas 3.0, ipywidgets 8.1
+
+numpy>=2.0
+astropy>=6.0
+sunpy>=6.0
+matplotlib>=3.8
+pandas>=2.0
+jinja2>=3.0        # table styling (pandas Styler)
+jupyterlab>=4.0
+
+# optional: radio buttons to choose the data set (without it, set DATASET in the parameters cell)
+ipywidgets>=8.0
+
+# optional, only for section 6 (open the data files of one flare): stixpy
+# pip install stixpy

@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<title>STIX flare list feedback</title>
+<style>
+  :root {
+    --bg: #fcfcfb; --surface: #ffffff; --ink: #0b0b0b; --ink2: #52514e; --line: #e6e5e1;
+    --accent: #2a78d6; --warn: #eb6834; --warn-bg: #fff4ee; --code-bg: #f3f2ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141413; --surface: #1d1d1b; --ink: #f1f0ec; --ink2: #b4b2ab; --line: #34332f;
+      --accent: #6aa6f0; --warn: #f08a5d; --warn-bg: #2b1d16; --code-bg: #262622;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141413; --surface: #1d1d1b; --ink: #f1f0ec; --ink2: #b4b2ab; --line: #34332f;
+    --accent: #6aa6f0; --warn: #f08a5d; --warn-bg: #2b1d16; --code-bg: #262622;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 820px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 1.9rem; line-height: 1.25; margin: 0 0 4px; }
+  h2 { font-size: 1.3rem; margin: 40px 0 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.05rem; margin: 20px 0 4px; }
+  p, li { color: var(--ink); }
+  .sub { color: var(--ink2); margin: 0 0 24px; }
+  a { color: var(--accent); }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 6px; overflow-x: auto; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  .warn {
+    border: 3px solid var(--warn); background: var(--warn-bg); border-radius: 6px;
+    padding: 12px 16px; margin: 24px 0;
+  }
+  .warn p { margin: 6px 0; }
+  .note { border-left: 4px solid var(--accent); padding: 4px 14px; margin: 16px 0; color: var(--ink2); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 16px 0; }
+  .card {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px;
+    display: flex; flex-direction: column;
+  }
+  .card h3 { margin: 0 0 4px; }
+  .card p { margin: 0 0 12px; color: var(--ink2); font-size: 0.95rem; flex: 1; }
+  .card a.btn {
+    display: inline-block; text-align: center; text-decoration: none; font-weight: 600;
+    background: var(--accent); color: #fff; border-radius: 6px; padding: 8px 12px;
+  }
+  .btns { display: flex; flex-wrap: wrap; gap: 8px; }
+  .btns .btn { flex: 1 1 auto; }
+  .size { color: var(--ink2); font-weight: 400; font-size: 0.9rem; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--ink2); font-weight: 600; }
+  td.num { text-align: right; white-space: nowrap; }
+  figure.cover { margin: 0 0 28px; }
+  figure.cover img { display: block; width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: #fcfcfb; }
+  figure.cover figcaption { color: var(--ink2); font-size: 0.9rem; margin-top: 6px; }
+  footer { margin-top: 48px; color: var(--ink2); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>STIX L3 flare list: request for feedback</h1>
+<p class="sub">Solar Orbiter / STIX &middot; preliminary flare list, version V05 &middot; November 2026</p>
+
+<figure class="cover">
+  <a href="STIX_L3_flarelist_showcase.html#5.5-Where-are-the-flares?" rel="nofollow">
+    <img src="cover.png" width="1790" height="545"
+         alt="Flare locations of 9 to 14 May 2023 from the STIX flare list, coloured by GOES class: on a heliographic map, as seen from Earth and as seen from Solar Orbiter">
+  </a>
+  <figcaption>From the notebook: flares of 9&ndash;14 May 2023 with a STIX location, as seen from Earth and from
+    Solar Orbiter. Open circles are flares not visible from Earth.</figcaption>
+</figure>
+
+<p>Dear colleagues,</p>
+<p>
+  the STIX team is preparing the first release of the STIX L3 flare list for the Solar Orbiter Archive (SOAR).
+  Before we publish it, we would like to hear from you: from the STIX team and from everyone who works, or plans to
+  work, with STIX flares. This page has a notebook that walks through the flare list, the data files, and how to send
+  us your feedback.
+</p>
+
+<div class="warn">
+  <p><strong>&#9888; Preliminary test release, for feedback only.</strong></p>
+  <p>The content, the columns and their definitions, and the values themselves <strong>may still change</strong>.</p>
+  <p>
+    <strong>Please do not use these files for scientific analyses or publications.</strong> Use the flare list for
+    science only once it is published in SOAR.
+  </p>
+</div>
+
+<h2>One flare list of possibly several</h2>
+<p>
+  A flare list is defined by the way its flares are detected: what counts as a flare, and when it starts, peaks and
+  ends. This version takes the operational flare list of the
+  <a href="https://datacenter.stix.i4ds.net/view/flares/list">STIX Data Center</a> as input (detected in the STIX quicklook light
+  curves) and adds the values computed in the STIX ground processing: peak values, background, location, observing
+  geometry and the Solar Orbiter campaign. This is what the <code>sdc</code> in the product name
+  <code>stix-flarelist-sdcloc</code> stands for.
+</p>
+<p>
+  The processing is open for more flare lists: future ones may be built around other detection algorithms and other
+  criteria of what a flare is, with the same set of computed values. So feedback on the computed values helps every
+  future flare list, too.
+</p>
+
+<h2>What we would like to know</h2>
+
+<h3>First: the data in the flare list files</h3>
+<p>Our main interest is the content of the flare list files:</p>
+<ul>
+  <li>Does it support your usual use cases, for example the way you look for specific flares?</li>
+  <li>Is something typical missing: a column, a value, a description that is unclear?</li>
+  <li>
+    Only a few standard header keywords of a file are searchable in SOAR. For the monthly flare list files we reuse
+    them for dedicated search options: the smallest / largest flare (net peak flux at 1 AU) and the shortest /
+    longest flare duration (section 7 of the notebook). Are these the right values to search by, or would others in
+    these keywords serve you better?
+  </li>
+</ul>
+<p class="note">
+  The flare list will be published as <strong>monthly files</strong> in SOAR, one file per month. For this feedback
+  round only, we also merged the monthly files into a year file and a mission file (January 2022 to August 2026),
+  so that you can easily look up <strong>your favourite flares</strong>, the ones you know well from your own
+  work. Check the numbers we computed for them: peak counts and fluxes, background, location, observing geometry.
+  Detailed feedback on these calculations is very welcome, e.g. a value that looks wrong, a different result from
+  your own analysis, or a definition you would compute differently. To look at a flare in the notebook, put its
+  <code>flare_id</code> into <code>SHOWCASE_FLARE_IDS</code> in section 2 (choose the mission data set for flares
+  outside 2023).
+</p>
+
+<h3>Second: working with the flare list in <code>stixpy</code></h3>
+<p>
+  All plots and filters in the notebook work directly on the plain data, on purpose. In <code>stixpy</code> we plan a
+  rich wrapper class (a <code>Product</code>) that gives you convenient access to the flare list and built-in plotting
+  routines, so you don't have to write them yourself. A preliminary version is shown in this demo:
+  <a href="https://stixpy--225.org.readthedocs.build/en/225/generated/gallery/flarelist_demo.html">stixpy flare list demo</a>.
+</p>
+<p>
+  You can give feedback on this next step in a separate GitHub issue:
+  <a href="https://github.com/TCDSolar/stixpy/issues/268">stixpy issue #268</a>.
+  Keep in mind that it is a chicken-and-egg problem: first we need to get the underlying data right, then the way to
+  work with it.
+</p>
+
+<h2>Get the notebook</h2>
+<p>The most useful feedback comes from working with the data yourself, so the options are listed from the recommended one to the quick look.</p>
+<div class="cards">
+  <div class="card">
+    <h3>Notebook + data <span class="size">(40 MB)</span></h3>
+    <p><strong>Recommended.</strong> Notebook, <code>requirements.txt</code> and all three data files, to work offline.</p>
+    <a class="btn" href="STIX_L3_flarelist_showcase_with_data.zip" rel="nofollow" download>Download .zip</a>
+  </div>
+  <div class="card">
+    <h3>Run in your browser</h3>
+    <p>Run and change the notebook online, nothing to install. Your changes stay in your own session.
+      Colab needs a Google account; Binder needs none, but starts slower and has too little memory for the mission
+      file.</p>
+    <div class="btns">
+      <a class="btn" href="https://colab.research.google.com/github/nicHoch/STIXCore/blob/flarelist/notebooks/flarelist_showcase/STIX_L3_flarelist_showcase.ipynb" rel="nofollow">Open in Colab</a>
+      <a class="btn" href="https://mybinder.org/v2/gh/nicHoch/STIXCore/flarelist?labpath=notebooks%2Fflarelist_showcase%2FSTIX_L3_flarelist_showcase.ipynb" rel="nofollow">Open in Binder</a>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Notebook only <span class="size">(1 MB)</span></h3>
+    <p>The Jupyter notebook. It downloads the data file you choose once, into its own folder.</p>
+    <a class="btn" href="STIX_L3_flarelist_showcase.ipynb" rel="nofollow" download>Download .ipynb</a>
+  </div>
+  <div class="card">
+    <h3>View only</h3>
+    <p>The notebook with all plots as a web page. Nothing to install: just read it.</p>
+    <a class="btn" href="STIX_L3_flarelist_showcase.html" rel="nofollow">Open as web page</a>
+  </div>
+</div>
+
+<h3>The data files</h3>
+<p>All three files have the same columns; they differ only in the period they cover, and so in the time it takes to download, load and filter them. The mission file with almost 100,000 flares is the one to look up any flare, but it takes noticeably longer; the month file is quick; the year file is in between and is the notebook default.</p>
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr><th>data set</th><th>period</th><th class="num">flares</th><th class="num">size</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><a href="solo_L3_stix-flarelist-sdcloc_20230501T000000-20230601T011216_V05.fits" rel="nofollow" download>Month 2023-05</a>
+        (regular monthly file)</td>
+      <td>2023-05-01 .. 2023-06-01</td><td class="num">1,695</td><td class="num">4 MB</td>
+    </tr>
+    <tr>
+      <td><a href="solo_L3_stix-flarelist-sdcloc_20230101T000000-20231231T230447_V05.fits" rel="nofollow" download>Year 2023</a>
+        (merged, notebook default)</td>
+      <td>2023-01-01 .. 2023-12-31</td><td class="num">21,381</td><td class="num">51 MB</td>
+    </tr>
+    <tr>
+      <td><a href="solo_L3_stix-flarelist-sdcloc_20220101T000000-20260831T232151_V05.fits" rel="nofollow" download>Mission</a>
+        (merged)</td>
+      <td>2022-01-01 .. 2026-08-31</td><td class="num">97,897</td><td class="num">411 MB</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2>How to get started</h2>
+<p>The notebook needs Python 3.12 or newer (as stixpy) and these packages
+  (<a href="requirements.txt" rel="nofollow" download>requirements.txt</a>):</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>package</th><th>version</th><th>used for</th></tr></thead>
+  <tbody>
+    <tr><td><code>numpy</code></td><td>&ge; 2.0</td><td>arrays</td></tr>
+    <tr><td><code>astropy</code></td><td>&ge; 6.0</td><td>reading the FITS file, units, times, coordinates</td></tr>
+    <tr><td><code>sunpy</code></td><td>&ge; 6.0</td><td>solar coordinate frames</td></tr>
+    <tr><td><code>matplotlib</code></td><td>&ge; 3.8</td><td>plots</td></tr>
+    <tr><td><code>pandas</code></td><td>&ge; 2.0</td><td>tables and time handling</td></tr>
+    <tr><td><code>jinja2</code></td><td>&ge; 3.0</td><td>table styling</td></tr>
+    <tr><td><code>jupyterlab</code></td><td>&ge; 4.0</td><td>running the notebook</td></tr>
+    <tr><td><code>ipywidgets</code></td><td>&ge; 8.0</td><td><em>optional:</em> radio buttons to choose the data set</td></tr>
+    <tr><td><code>stixpy</code></td><td></td><td><em>optional:</em> only section 6, opening the data files of one flare</td></tr>
+  </tbody>
+</table>
+</div>
+<ol>
+  <li>Unpack the zip, or put the <code>.ipynb</code> (and <code>requirements.txt</code>) into an empty folder.</li>
+  <li>Create a virtual environment and install the packages:
+<pre><code>python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt</code></pre>
+  </li>
+  <li>Start Jupyter, open <code>STIX_L3_flarelist_showcase.ipynb</code>, choose the data set in section 2 and
+    run all cells:
+<pre><code>jupyter lab</code></pre>
+  </li>
+</ol>
+<p class="note">
+  If the chosen data file is not in the notebook folder, the notebook downloads it once into that folder and uses it
+  from there next time.
+</p>
+
+<h2>How to send feedback</h2>
+<ul>
+  <li>
+    <strong>Preferably as a comment in the GitHub issue:</strong>
+    <a href="https://github.com/i4Ds/STIXCore/issues/462">STIXCore issue #462</a>.
+  </li>
+  <li>
+    <strong>Already raised?</strong> If someone has already made your point in the issue, please comment on it or
+    at least add a &#128077; (+1) reaction. That shows us how important a point is to the community and helps us
+    decide what to do first.
+  </li>
+  <li>
+    <strong>If GitHub is not possible for you:</strong> send an email to
+    <a href="mailto:nicky.hochmuth@ateleris.ch?subject=STIX%20L3%20flare%20list%20feedback">nicky.hochmuth@ateleris.ch</a>.
+  </li>
+</ul>
+
+<h2>What happens with your feedback</h2>
+<ul>
+  <li><strong>Obvious errors</strong> (wrong values, broken columns, misleading descriptions) will be fixed before
+    the first release in SOAR.</li>
+  <li><strong>New requests</strong> (additional columns, values or header keywords) will be collected and
+    prioritised, and may come in a later version of the flare list. Your comments and &#128077; reactions in the
+    issues help us set the priorities.</li>
+</ul>
+
+<p>Thank you for your time and your feedback!</p>
+
+<footer>
+  STIX team &middot; STIX L3 flare list, preliminary version V05 &middot; page of November 2026
+</footer>
+
+</main>
+</body>
+</html>

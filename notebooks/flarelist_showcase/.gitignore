@@ -1,0 +1,7 @@
+# large files of the feedback page: hosted on pub099, not in git (the notebook downloads the data on demand)
+*.fits
+*.zip
+*.zip.part
+# built by build_feedback_bundle.py for the feedback page on pub099
+STIX_L3_flarelist_showcase.html
+cover.png

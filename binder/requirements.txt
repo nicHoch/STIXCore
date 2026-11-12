@@ -1,0 +1,3 @@
+# Binder (mybinder.org) environment for the STIX L3 flare list showcase notebook
+# the packages are those of the notebook folder; the binder/ folder keeps Binder from installing STIXCore itself
+-r ../notebooks/flarelist_showcase/requirements.txt
